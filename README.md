@@ -5,7 +5,7 @@
 [![Tiel-Coder model](https://img.shields.io/badge/Tiel--Coder-Hugging%20Face-orange.svg)](https://huggingface.co/arcitech-psp/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP)
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/arcitech-logo-white.png"><img src="assets/arcitech-logo-black.png" alt="ArciTech logo"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.png"><img src="assets/hero-light.png" alt="vLLM XPU for Intel Arc"></picture>
+<img src="assets/hero-dark.png" alt="vLLM XPU for Intel Arc">
 
 This is a reviewable local build recipe for the best working Intel Arc/XPU
 route measured with Tiel-Coder: compressed-tensors W4A16 expert weights, the
@@ -63,36 +63,34 @@ Everything below was read from the machine itself.
 | Serving stack | Docker 29.1.3, vLLM 0.27.2rc1.dev77+gac7509e2b ([custom XPU build](https://github.com/arcitech-psp/vllm-xpu-arc)), PyTorch 2.13.0+xpu, vllm-xpu-kernels 0.1.12.3 |
 | Serving settings | FP8 KV cache, 131,072-token context, 4 concurrent sequences, 4,096 max batched tokens, 3 MTP draft tokens |
 
-## Read the measured results
+## Measured results
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/speed-comparison-dark.png"><img src="assets/speed-comparison-light.png" alt="Per-user and shared total decode speed at one, two, and four users"></picture>
+<img src="assets/card-quality-speed.png" alt="Points missed and seconds per task on the same 100-task agentic coding eval: Tiel-Coder XPU 5 missed in 0.36 s, community GGUF on vLLM 7 and 8 missed in 1.27 s and 1.23 s, AutoRound int4 9 to 11 missed in 0.34 to 0.35 s">
 
-| Build | 1 user | 2 users | 4 users |
+Every build below carries the same Ornith-1.5 weights and Sharp template and ran through the same runner,
+the same 100 tasks and the same Arc Pro B70.
+
+| Build | Points (of 224) | Missed | Seconds per task |
 |---|---:|---:|---:|
-| GPTQ-A, per-stream / aggregate tok/s | 116.9 / 113.4 | 105.9, 113.6 / 195.6 | 94.0, 92.5, 92.5, 93.0 / 339.9 |
-| FAST CT2, per-stream / aggregate tok/s | 132.0 / 127.7 | 120.8, 125.0 / 228.6 | 99.3, 101.1, 101.0, 100.4 / 374.8 |
+| **Tiel-Coder XPU (ours) — GPTQ-A int4 + MTP** | **219** | **5** | **0.36** |
+| Community Tiel GGUF on vLLM — BF16 dense | 217 | 7 | 1.27 |
+| Community Tiel GGUF on vLLM — FP8 dense | 216 | 8 | 1.23 |
+| Community AutoRound int4 + MTP (two runs) | 213–215 | 9–11 | 0.34–0.35 |
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/quality-comparison-dark.png"><img src="assets/quality-comparison-light.png" alt="Internal 224-task coding evaluation comparison"></picture>
+Our build scores highest (code 181/184, tool 18/20, edit 20/20) and finishes each task 3.4× faster than the
+GGUF route. The aggregate summaries are in the [data repository](https://github.com/arcitech-psp/tiel-coder-xpu/tree/main/bench/eval).
 
-| Build | Total | Code (184) | Tool (20) | Edit (20) |
-|---|---:|---:|---:|---:|
-| GPTQ-A | 219 / 224 | 181 | 18 | 20 |
-| FAST CT2 | 213–215 / 224 | 176–178 | 18 | 19 |
+<img src="assets/card-throughput.png" alt="Decode speed per user and in total at one, two and four users: 116.9 tokens/s for one user, 339.9 tokens/s total for four">
 
-This internal evaluation is aggregate-only; task prompts and per-task records
-are not released.
+| Users at once | Per user (tokens/s) | Total (tokens/s) |
+|---|---:|---:|
+| 1 | 116.9 | 113.4 |
+| 2 | 105.9–113.6 | 195.6 |
+| 4 | 92.5–94.0 | 339.9 |
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/precision-split-dark.png"><img src="assets/precision-split-light.png" alt="Logical precision split"></picture>
+<img src="assets/card-inside.png" alt="93.5 percent of the weights are routed experts in GPTQ int4; 6.5 percent stay in BF16">
 
-The logical parameter split is approximately 93.5% routed expert GPTQ int4 and
-6.5% BF16. Attention, routing, normalization, embeddings, shared experts, the
-vision tower, output head, and MTP tensors remain BF16.
-
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/mtp-acceptance-dark.png"><img src="assets/mtp-acceptance-light.png" alt="MTP acceptance by draft position"></picture>
-
-MTP proposes tokens ahead and lets the main model verify several at once when
-the guesses match. GPTQ-A acceptance by configured draft position was 74.3%,
-50.9%, and 35.6%.
+<img src="assets/card-mtp.png" alt="Multi-token prediction acceptance by draft position: 74.3, 50.9 and 35.6 percent">
 
 ## How to read this
 
