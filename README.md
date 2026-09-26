@@ -6,97 +6,127 @@
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/arcitech-logo-white.png"><img src="assets/arcitech-logo-black.png" alt="ArciTech logo"></picture>
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.png"><img src="assets/hero-light.png" alt="vLLM XPU for Intel Arc"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/throughput-dark.png"><img src="assets/throughput-light.png" alt="FAST and GPTQ-A aggregate throughput comparison"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/precision_map-dark.png"><img src="assets/precision_map-light.png" alt="Tiel-Coder logical precision map"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/layer_gptq_relative_error-dark.png"><img src="assets/layer_gptq_relative_error-light.png" alt="GPTQ relative error by decoder layer"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/mtp_acceptance-dark.png"><img src="assets/mtp_acceptance-light.png" alt="FAST and GPTQ-A MTP acceptance comparison"></picture>
 
-This is a reviewable, local build recipe for the best working Intel Arc/XPU
-path we have measured with Tiel-Coder: compressed-tensors W4A16 expert weights,
-the official BF16 MTP head, and three speculative draft tokens. The default
-build is based on vLLM commit `ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9`
-(`0.27.2rc1.dev77+gac7509e2b`), the runtime every number below was measured on,
-and includes the core patch, the XPU GGUF plugin source, and optional research
-paths. We are only trying to get something useful out there; the numbers below
-are campaign measurements, not a certification for every model, driver, or
-future vLLM release.
+This is a reviewable local build recipe for the best working Intel Arc/XPU
+route measured with Tiel-Coder: compressed-tensors W4A16 expert weights, the
+official BF16 MTP head, and three speculative draft tokens. It is a measured
+route, not a certification for every model, driver, or future vLLM release.
 
-A rebase onto vLLM `v0.30.0` is included under
-[`experimental/v0.30-rebase/`](experimental/v0.30-rebase/). It applies cleanly
-at source level but **has not been built or served yet**, and stock v0.30.0
-crashed on this model in our test window (details below). Use the default
-build unless you want to help test the rebase.
+## At a glance
+
+- **One Intel Arc Pro B70, 32 GB** served the tested 35B-parameter coding model.
+- **116.9 tokens/s for one user; 339.9 tokens/s shared across four** on GPTQ-A.
+- **219 of 224** on the internal agentic coding evaluation.
+- **Four 131,072-token conversations at once** in the measured configuration.
+- **vLLM 0.27.2rc1.dev77+gac7509e2b**, a custom XPU build with PyTorch XPU support.
+
+Tokens per second (tokens/s) is how quickly generated text arrives. A shared
+total is the combined output of several concurrent users.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/test-bench-dark.png"><img src="assets/test-bench-light.png" alt="ArciTech test bench specification card"></picture>
+
+## Test system
+
+The short version: a consumer AM4 desktop with one 32 GB workstation GPU — no
+datacenter hardware.
+
+<details>
+<summary>Full test system</summary>
+
+| Part | Value |
+|---|---|
+| GPU 1 (serves the model) | Intel Arc Pro B70, 32 GB |
+| GPU 2 (in the machine, not used for these tests) | Intel Arc A310 LP, 4 GB |
+| CPU | AMD Ryzen 7 5800X, 8 cores / 16 threads |
+| System memory | 32 GB DDR4-3200 (4 × 8 GB) |
+| Motherboard | ASUS ROG Strix B550-F Gaming (AM4, PCIe 4.0) |
+| Model storage (weights served from here) | 1 TB Samsung PM9A1 NVMe SSD (PCIe 4.0) |
+| Other storage (archive only; the model was not loaded from it) | 1.5 TB WD Green HDD |
+| OS | Ubuntu 24.04.4 LTS, Linux kernel 7.0 |
+| Intel GPU runtime | compute-runtime 26.22.38646.4 (Level Zero + OpenCL), Level Zero loader 1.28.6, IGC 2.11.12 |
+| Container | Docker 29.1.3 |
+| Serving stack | vLLM 0.27.2rc1.dev77+gac7509e2b (custom XPU build, `vllm-xpu-arc`), PyTorch 2.13.0+xpu, vllm-xpu-kernels 0.1.12.3 |
+| Serving settings | FP8 KV cache, 131,072-token context, 4 concurrent sequences, 4,096 max batched tokens, MTP with 3 draft tokens |
+
+</details>
+
+## Read the measured results
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/speed-comparison-dark.png"><img src="assets/speed-comparison-light.png" alt="Per-user and shared total decode speed at one, two, and four users"></picture>
+
+| Build | 1 user | 2 users | 4 users |
+|---|---:|---:|---:|
+| GPTQ-A, per-stream / aggregate tok/s | 116.9 / 113.4 | 105.9, 113.6 / 195.6 | 94.0, 92.5, 92.5, 93.0 / 339.9 |
+| FAST CT2, per-stream / aggregate tok/s | 132.0 / 127.7 | 120.8, 125.0 / 228.6 | 99.3, 101.1, 101.0, 100.4 / 374.8 |
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/quality-comparison-dark.png"><img src="assets/quality-comparison-light.png" alt="Internal 224-task coding evaluation comparison"></picture>
+
+| Build | Total | Code (184) | Tool (20) | Edit (20) |
+|---|---:|---:|---:|---:|
+| GPTQ-A | 219 / 224 | 181 | 18 | 20 |
+| FAST CT2 | 213–215 / 224 | 176–178 | 18 | 19 |
+
+This internal evaluation is aggregate-only; task prompts and per-task records
+are not released.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/precision-split-dark.png"><img src="assets/precision-split-light.png" alt="Logical precision split"></picture>
+
+The logical parameter split is approximately 93.5% routed expert GPTQ int4 and
+6.5% BF16. Attention, routing, normalization, embeddings, shared experts, the
+vision tower, output head, and MTP tensors remain BF16.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/mtp-acceptance-dark.png"><img src="assets/mtp-acceptance-light.png" alt="MTP acceptance by draft position"></picture>
+
+MTP proposes tokens ahead and lets the main model verify several at once when
+the guesses match. GPTQ-A acceptance by configured draft position was 74.3%,
+50.9%, and 35.6%.
+
+## How to read this
+
+- **Token:** a small piece of text; words may be one or several tokens.
+- **Tokens/s:** generated tokens per second, a practical speed measure.
+- **MoE:** mixture of experts; only selected experts handle each token.
+- **int4 / BF16:** compact 4-bit routed-expert weights and retained 16-bit tensors.
+- **MTP:** multi-token prediction; a draft path proposes tokens for verification.
+- **KV cache:** saved attention state that avoids recomputing the conversation so far.
+- **Context:** the maximum conversation length the model can consider at once.
 
 ## Best working path
 
-The default path is the compressed-tensors Tiel-Coder deployment. It was
-measured on one Intel Arc Pro B70 with 32 GB using vLLM
-`0.27.2rc1.dev77+gac7509e2b`, PyTorch `2.13.0+xpu`,
+The default route uses the compressed-tensors Tiel-Coder deployment and was
+measured with vLLM `0.27.2rc1.dev77+gac7509e2b`, PyTorch `2.13.0+xpu`,
 `vllm-xpu-kernels 0.1.12.3`, FP8 KV cache, a 131,072-token maximum context,
 four sequence slots, 4,096 maximum batched tokens, and three MTP drafts.
 
-| Measurement | Result |
-|---|---:|
-| Historical FAST CT2 single-request decode | 133–138 tok/s |
-| Historical FAST CT2 four-request aggregate decode | 365–378 tok/s |
-| Historical FAST CT2 MTP acceptance | 67–81% |
-| Night reference FAST CT2 / GPTQ-A, 1 stream | 132.0 / 113.4 tok/s |
-| Night reference FAST CT2 / GPTQ-A, 4-stream aggregate | 374.8 / 339.9 tok/s |
-| Night reference MTP acceptance | FAST 66.7% / 42.0% / 24.7%; GPTQ-A 74.3% / 50.9% / 35.6% by position |
-| Agentic evaluation | 213–215 / 224 |
-| Long-context capacity | 4 × 131,072-token slots in the measured pool |
+The repository contains source and build recipes, not model weights or runtime
+caches. Build the pinned core patch and image, then mount the model read-only
+using the launcher supplied with the release. Set the launcher's model input to
+the model you downloaded from the
+[Hugging Face model page](https://huggingface.co/arcitech-psp/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP).
 
-The tested model is [Tiel-Coder 35B-A3B GPTQ W4A16](https://huggingface.co/arcitech-psp/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP).
-The companion data and reproduction repo is
-[https://github.com/arcitech-psp/tiel-coder-xpu](https://github.com/arcitech-psp/tiel-coder-xpu).
+```bash
+git clone https://github.com/vllm-project/vllm.git
+git -C vllm checkout ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9
+./scripts/apply-vllm-core-patch.sh vllm
+docker build -t vllm-xpu-arc:local .
+```
 
-## Upstream rebase and status (experimental)
+Use the model's Tiel Sharp template, BF16 compute, FP8 KV cache, four 131K
+slots, three MTP drafts, and the parser settings shown in the model card.
+Re-measure capacity for a different model, driver, or slot count.
 
-Everything in this section concerns the **experimental** v0.30.0 rebase in
-`experimental/v0.30-rebase/`, not the default build. The rebased core patch was
-checked against the local v0.30.0 source checkout on 2026-09-25. Upstream feature references are linked to vLLM pull requests; the
-local delta is limited to XPU-specific behavior not duplicated by that release.
+## For practitioners
 
-| Area | Classification | Boundary |
-|---|---|---|
-| DFlash2 | UPSTREAM | Candidate selector and local convolution: [#52816](https://github.com/vllm-project/vllm/pull/52816), with fused grouped convolution in [#55960](https://github.com/vllm-project/vllm/pull/55960). The old work-in-progress is not duplicated. |
-| DSpark | UPSTREAM | The upstream DSpark implementation is [#46995](https://github.com/vllm-project/vllm/pull/46995). The old work-in-progress is not duplicated. |
-| Model Runner V2 and offload tiers | UPSTREAM | Weight offloading [#51413](https://github.com/vllm-project/vllm/pull/51413), tiered KV offload [#49644](https://github.com/vllm-project/vllm/pull/49644), and MRV2 default [#53183](https://github.com/vllm-project/vllm/pull/53183). |
-| XPU grouped_topk and SYCL activation CustomOps | UPSTREAM | v0.30.0 includes [#53580](https://github.com/vllm-project/vllm/pull/53580) and [#53734](https://github.com/vllm-project/vllm/pull/53734). |
-| Qwen3.5 MTP quantization exclusion | UPSTREAM baseline | The v0.30 source carries the exclusion behavior; no local patch is claimed for it. |
-| Mixed XPU GDN dispatch | STILL OURS | `0001` splits mixed spec/non-spec batches because the fused XPU call remains exclusive for that combination. |
-| XPU GDN snapshot-copy contract | STILL OURS | Opt-in state-layout correction; separate from CUDA rolling-convolution storage. |
-| Adaptive MTP and exact C1 graph capture | STILL OURS | Opt-in research gates in `adaptive/` and `0001`; disabled by Docker defaults. |
-| oneDNN MXFP4 W4A16 and draft INT4 | STILL OURS | Separate from v0.30 native XPU MXFP4 and MTP paths; optional only. |
-| GGUF XPU plugin and SYCL k-quant MoE | STILL OURS | Out-of-tree plugin delta; it was rebased from the old private baseline onto plugin main `e2b8ad532b8b`. |
+### Feature matrix
 
-Patch artifact classification:
-
-| Patch | Classification | Evidence |
-|---|---|---|
-| `patches/0001-vllm-ac7509e2b-xpu-extras.patch` | DEFAULT | The core delta the measured runtime was built from, against `ac7509e2b`. |
-| `patches/0002-vllm-gguf-plugin-56bfc18.patch` | DEFAULT | The GGUF plugin delta against plugin `56bfc18`. |
-| `experimental/v0.30-rebase/patches/0001-vllm-v0.30.0-ced6857-xpu-extras.patch` | EXPERIMENTAL | 9 files; clean `git apply --check` on v0.30.0. Not built or served. |
-| `experimental/v0.30-rebase/patches/0002-vllm-gguf-plugin-e2b8ad5.patch` | EXPERIMENTAL | 14 files; clean apply to plugin main `e2b8ad532b8b5ea175100202c30430c1d2b5e6a8`. Not built or served. |
-
-| STATUS | Result |
-|---|---|
-| Core patch | Rebasing complete; applies cleanly to v0.30.0. Not yet built or served. |
-| GGUF patch | Rebasing complete; applies cleanly to plugin main `e2b8ad5`. Not yet built or served. |
-| Stock v0.30.0 serving | GPTQ-A loaded and reached compile/warmup, then segfaulted in stock SYCL top-k; a no-graph retry failed XPU memory reservation before `/v1/models`. |
-| Performance | Exact reference method completed on FAST and custom GPTQ-A; stock performance was not measured. |
-| Sharp template | Updated to latest fetched v22.5.0 content; diff is limited to removal of the model-specific terse lead. |
-
-## Feature matrix
-
-Status labels describe the measured boundary. `working` means the path
-was exercised in the campaign; `partial` and `experimental` are included for
+Status labels describe the measured boundary. `working` means the path was
+exercised in the campaign; `partial` and `experimental` are included for
 review and future work, not as the default launch route.
 
 | Feature | Status | Tested boundary |
 |---|---|---|
 | Compressed-tensors W4A16 fused int4 MoE | working | Tiel-Coder body, group 128, native XPU fused-MoE path. |
-| MTP speculative decoding | working | Official BF16 MTP head, three drafts, 67–81% measured acceptance. |
+| MTP speculative decoding | working | Official BF16 MTP head, three drafts, measured acceptance reported above. |
 | FP8 KV cache | working | Used in the measured Tiel-Coder and long-context runs. |
 | Tool calling | working | `qwen3_coder`, including streamed calls. |
 | Reasoning parser | working | `qwen3` reasoning/content split on the tested path. |
@@ -110,90 +140,37 @@ review and future work, not as the default launch route.
 | DFlash2 / DSpark | UPSTREAM | Use v0.30.0's upstream implementations; the local adaptive MTP path is not a substitute. |
 | Weight and KV offload tiers | UPSTREAM | Present in v0.30.0; not implemented by this repository's patch. |
 
-The stock v0.30.0 DFlash2/DSpark, grouped-top-k, SYCL activation, and graph
-features are upstream capabilities. Their presence does not prove that the
-local W4A16/MTP performance path is unchanged; that requires a side-by-side
+### Experimental v0.30.0 rebase
+
+The rebase under `experimental/v0.30-rebase/` applies cleanly at source level,
+but **has not been built or served**. Stock v0.30.0 loaded GPTQ-A and reached
+compile/warmup, then segfaulted in stock SYCL top-k; a no-graph retry failed the
+XPU memory reservation before a model endpoint became available. Stock
+performance was not measured. Use the default build for the measured route.
+
+The rebase keeps upstream v0.30 features separate from local XPU deltas:
+mixed XPU GDN dispatch, the XPU GDN snapshot-copy contract, adaptive MTP and
+exact C1 graph gates, optional oneDNN MXFP4 W4A16 and draft int4, and the GGUF
+XPU plugin/SYCL k-quant MoE path. Those optional paths are not the release
 benchmark.
 
-Failed experiments: notes coming later.
+### Included source
 
-## Install and build
-
-The repository contains source and build recipes, not model weights or runtime
-caches. The core patch is the authoritative review artifact.
-
-```bash
-git clone https://github.com/vllm-project/vllm.git
-git -C vllm checkout ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9
-./scripts/apply-vllm-core-patch.sh ./vllm
-docker build -t vllm-xpu-arc:local .
-```
-
-The Dockerfile rebuilds the measured runtime from the public vLLM XPU base
-image digest for that commit plus the patches here. It is a reconstruction:
-the measured image was built in place, and this Dockerfile has not yet been
-rebuilt from scratch on a clean machine. Please report whether it builds for
-you.
-
-To try the experimental v0.30.0 rebase instead:
-
-```bash
-git -C vllm checkout ced6857afa0ea7b2e3f0846a62e1394e90f15607
-./experimental/v0.30-rebase/scripts/apply-vllm-core-patch.sh ./vllm
-docker build -f experimental/v0.30-rebase/Dockerfile -t vllm-xpu-arc:v030-test .
-```
-
-The Dockerfile applies the pinned core patch, installs the included GGUF
-plugin without its CUDA extension, compiles the SYCL GGUF kernel, and builds
-the optional adaptive GDN and MXFP4 extensions. The optional native build
-helpers assert that `torch.xpu` has not been initialized during compilation:
-
-```bash
-python adaptive/build_kernel.py
-python mxfp4/build_mxfp4_w4a16.py --onednn installed
-```
-
-The MXFP4 recipe expects an external oneDNN source/install with Intel GPU
-SYCL support. It is not required for the best working Tiel-Coder path.
-
-## Run the best working path
-
-Mount the model read-only and use the supplied launcher:
-
-```bash
-MODEL_DIR=/models/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP \
-IMAGE=vllm-xpu-arc:local \
-./scripts/serve-example.sh
-```
-
-The launcher keeps model weights outside this repository. Use the model's
-Tiel Sharp template, BF16 compute, FP8 KV, four 131K slots, three MTP drafts,
-and the parser settings shown in the model repository. Re-measure memory
-capacity for a different model, driver, or slot count.
-
-## What is included
-
-- `patches/0001-vllm-ac7509e2b-xpu-extras.patch` — the vLLM core delta for
-  XPU dispatch, MTP hooks, replay pinning, exact C1 graphs, and optional draft
-  paths, against the measured `ac7509e2b` base.
-- `patches/0002-vllm-gguf-plugin-56bfc18.patch` — the included GGUF plugin
-  delta and XPU k-quant MoE path.
-- `experimental/v0.30-rebase/` — the same deltas rebased onto vLLM v0.30.0 and
-  plugin main `e2b8ad5`, with their own Dockerfile and apply script. Source-level
-  checks only; not built or served yet.
+- `patches/0001-vllm-ac7509e2b-xpu-extras.patch` — measured XPU core delta.
+- `patches/0002-vllm-gguf-plugin-56bfc18.patch` — included GGUF plugin delta.
+- `experimental/v0.30-rebase/` — source-level rebase, not built or served.
 - `plugins/vllm-gguf-plugin/` — plugin source and tests.
 - `adaptive/` — optional adaptive MTP and Gated DeltaNet SYCL sources.
 - `mxfp4/` — optional oneDNN-backed MXFP4 W4A16 sources.
 - `scripts/` — patch and container-run helpers.
 
-## Limits
+## Limits and privacy
 
-The working measurements were made on one Intel Arc Pro B70. Other Intel GPUs,
-CUDA, stock-vLLM equivalence, and future driver combinations are untested.
-Four 180K contexts exceeded the measured pool; keep the documented four-slot,
-131,072-token boundary until a new capacity measurement exists. The Docker
-build was not executed on this preparation machine; source, patch, compile,
-and privacy checks were performed.
+- Working measurements were made on one Intel Arc Pro B70.
+- Other Intel GPUs, CUDA, stock-vLLM equivalence, and future driver combinations are untested.
+- The measured boundary is four 131,072-token slots; larger contexts require a new capacity measurement.
+- The Docker build was not executed on this preparation machine; source, patch, compile, and privacy checks were performed.
+- No calibration data or private prompts are included.
 
 ## Credits
 
@@ -203,23 +180,17 @@ Tiel and the Sharp template, biMEMO's earlier reference work, and the Hugging
 Face community. The related model is published at the
 [Hugging Face account `arcitech-psp`](https://huggingface.co/arcitech-psp).
 
-Credit: GPT 5.6 Luna (Codex), directed by Claude.
-
-### Sharp template provenance
-
-Latest fetched source: `peculiar-ragdoll/Qwen-Sharp-Chat-Templates`, revision
-`85461fc118aaf25e7319c7ecf2481f944aac3a32`, modified 2026-09-10. The local
-fixture differs only in the two terse-lead strings: the latest revision removes
-the model-identifying phrase. The fixture was not changed during this rebase.
-
 ## Feedback and contact
 
-Feedback form: [https://docs.google.com/forms/d/1gaUBeulGlZwo8gt4eucGpg3biCKy-tli79urdTesXSI/viewform](https://docs.google.com/forms/d/1gaUBeulGlZwo8gt4eucGpg3biCKy-tli79urdTesXSI/viewform). Direct contact:
-[parthpatel266@gmail.com](mailto:parthpatel266@gmail.com). GitHub account:
-[arcitech-psp](https://github.com/arcitech-psp).
+Feedback form: [Google Form](https://docs.google.com/forms/d/1gaUBeulGlZwo8gt4eucGpg3biCKy-tli79urdTesXSI/viewform).
+Direct contact: [parthpatel266@gmail.com](mailto:parthpatel266@gmail.com).
+GitHub account: [arcitech-psp](https://github.com/arcitech-psp).
 
-## License and attribution
+## License and related pages
 
 Upstream vLLM and plugin files retain their Apache-2.0 notices. New code in
 this repository follows Apache-2.0 as documented in `LICENSE` and `NOTICE`.
-Please review the upstream attribution before publishing a derivative build.
+
+- [Tiel-Coder data repository](https://github.com/arcitech-psp/tiel-coder-xpu)
+- [Tiel-Coder model card](https://huggingface.co/arcitech-psp/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP)
+- [How Tiel-Coder XPU was built](../docs/APPROACH.md)
