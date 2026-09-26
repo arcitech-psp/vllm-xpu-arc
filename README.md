@@ -214,7 +214,7 @@ the model-identifying phrase. The fixture was not changed during this rebase.
 
 ## Feedback and contact
 
-Feedback form: [FEEDBACK_FORM_URL](FEEDBACK_FORM_URL). Direct contact:
+Feedback form: [https://docs.google.com/forms/d/1gaUBeulGlZwo8gt4eucGpg3biCKy-tli79urdTesXSI/viewform](https://docs.google.com/forms/d/1gaUBeulGlZwo8gt4eucGpg3biCKy-tli79urdTesXSI/viewform). Direct contact:
 [parthpatel266@gmail.com](mailto:parthpatel266@gmail.com). GitHub account:
 [arcitech-psp](https://github.com/arcitech-psp).
 
