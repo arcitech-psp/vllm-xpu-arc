@@ -1,0 +1,767 @@
+diff --git a/setup.py b/setup.py
+index 804223a8eeb5bfd38c8968b73c5115a320a79958..6e34e920dfbbd3b26c3d1a60ab4705854174b6d2 100644
+--- a/setup.py
++++ b/setup.py
+@@ -25,7 +25,7 @@ def _should_build_extension() -> bool:
+ 
+ setup_kwargs: dict = {"version": _package_version()}
+ 
+-if _should_build_extension():
++if _should_build_extension() and os.environ.get("VLLM_GGUF_PLUGIN_SKIP_EXT") != "1":
+     import torch
+     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+ 
+diff --git a/vllm_gguf_plugin/ops.py b/vllm_gguf_plugin/ops.py
+index cc3a0d3f2deab9445ff539a616b6ca7d2ed5a915..a660aa92008920a8700efdb270d297def925974c 100644
+--- a/vllm_gguf_plugin/ops.py
++++ b/vllm_gguf_plugin/ops.py
+@@ -257,6 +257,10 @@ def ggml_moe_a8_vec(
+         return torch.ops._C_gguf.ggml_moe_a8_vec(
+             X, W, topk_ids, top_k, quant_type, row, tokens
+         )
++    if sycl_moe_available(X, quant_type):
++        from .xpu_kernels import moe_vec
++
++        return moe_vec(X, W, topk_ids, top_k, quant_type, row)
+     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+ 
+     E = W.shape[0]
+@@ -276,11 +280,29 @@ def ggml_moe_a8_vec(
+     )
+ 
+ 
++def sycl_moe_available(X: torch.Tensor, quant_type: int) -> bool:
++    """XPU SYCL kernel for k-quant experts (exact float dot products)."""
++    if X.device.type != "xpu":
++        return False
++    from . import xpu_kernels
++
++    return int(quant_type) in xpu_kernels.SYCL_MOE_TYPES and xpu_kernels.available()
++
++
+ def ggml_moe_get_block_size(quant_type: int) -> int:
+     if _cuda_gemm_kernel_available("ggml_moe_get_block_size", quant_type):
+         return torch.ops._C_gguf.ggml_moe_get_block_size(quant_type)
+     return get_triton_moe_block_m(quant_type)
+ 
+ 
++def _moe_sum_takes_topk() -> bool:
++    # vllm-xpu-kernels declares moe_sum(input, output, topk_ids?, expert_map?).
++    schema = torch.ops._moe_C.moe_sum.default._schema
++    return len(schema.arguments) > 2
++
++
+ def moe_sum(input: torch.Tensor, output: torch.Tensor) -> None:
+-    torch.ops._moe_C.moe_sum(input, output)
++    if _moe_sum_takes_topk():
++        torch.ops._moe_C.moe_sum(input, output, None, None)
++    else:
++        torch.ops._moe_C.moe_sum(input, output)
+diff --git a/vllm_gguf_plugin/plugin.py b/vllm_gguf_plugin/plugin.py
+index b76095ad1d074a16aa163fd8bdd8646680e5ae2b..5f5321fa8f074cf3ef565c807e79beb0082ec66c 100644
+--- a/vllm_gguf_plugin/plugin.py
++++ b/vllm_gguf_plugin/plugin.py
+@@ -127,8 +127,19 @@ def _register_omni_diffusion_quantization() -> None:
+     register_quantization_override("gguf", lambda **kw: DiffusionGGUFConfig(**kw))
+ 
+ 
++def _allow_gguf_on_xpu() -> None:
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_xpu():
++        return
++    supported = current_platform.supported_quantization
++    if "gguf" not in supported:
++        supported.append("gguf")
++
++
+ def register() -> None:
+     """Register the out-of-tree GGUF integration."""
++    _allow_gguf_on_xpu()
+     register_quantization_config("gguf")(GGUFConfig)
+     _register_omni_diffusion_quantization()
+ 
+diff --git a/vllm_gguf_plugin/quantization/fused_moe.py b/vllm_gguf_plugin/quantization/fused_moe.py
+index 758429b382c01189b5e6f3325becdd4070213fe2..99a242d28612036d6a5629a6316e89182348ec01 100644
+--- a/vllm_gguf_plugin/quantization/fused_moe.py
++++ b/vllm_gguf_plugin/quantization/fused_moe.py
+@@ -31,6 +31,80 @@ from .params import (
+ from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
+ 
+ 
++def _xpu_grouped_proj(A, W, qtype, counts, group):
++    """A is sorted by expert id (counts[e] rows each). Returns W[e] @ a for every row, via XMX GEMM."""
++    import gguf
++
++    block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
++    E, rows, nbytes = W.shape
++    cols = nbytes // type_size * block_size
++    out = torch.empty((A.shape[0], rows), dtype=A.dtype, device=A.device)
++    active = [e for e, c in enumerate(counts) if c]
++    compact = len(active) < E // 2
++    ids = active if compact else list(range(E))
++    start = 0
++    for i in range(0, len(ids), group):
++        chunk = ids[i:i + group]
++        cnt = [counts[e] for e in chunk]
++        ntok = sum(cnt)
++        if ntok == 0:
++            continue
++        if compact:
++            Wq = W.index_select(0, torch.tensor(chunk, device=W.device, dtype=torch.long))
++        else:
++            Wq = W[chunk[0]:chunk[-1] + 1]
++        g = Wq.shape[0]
++        Wd = ops.ggml_dequantize(Wq.reshape(g * rows, nbytes), qtype, g * rows, cols, A.dtype)
++        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
++            ptr_A=A[start:start + ntok],
++            ptr_A_scale=None,
++            # the XPU grouped GEMM takes weights as [experts, in, out]
++            ptr_B=Wd.view(g, rows, cols).transpose(1, 2).contiguous(),
++            ptr_B_scale=None,
++            ptr_bias=None,
++            ptr_D=out[start:start + ntok],
++            rows_per_expert=torch.tensor(cnt, device=A.device, dtype=torch.int32),
++            N=rows,
++            K=cols,
++            num_experts=g,
++        )
++        start += ntok
++    return out
++
++
++def _xpu_grouped_moe(x, w1, w2, topk_weights, topk_ids, weight_type, weight_type2, act):
++    import os
++
++    import vllm_xpu_kernels._moe_C  # noqa: F401  (registers _moe_C ops)
++    import vllm_xpu_kernels._xpu_C  # noqa: F401
++
++    group = int(os.environ.get("VLLM_GGUF_XPU_PREFILL_GROUP", "64"))
++    num_tokens, top_k = topk_ids.shape
++    E = w1.shape[0]
++    hidden = x.shape[1]
++    remapped = torch.empty((num_tokens * top_k, hidden), dtype=x.dtype, device=x.device)
++    rows_per_expert = torch.zeros((E,), dtype=torch.int32, device=x.device)
++    unpermuted = torch.empty((num_tokens, top_k), dtype=torch.int32, device=x.device)
++    torch.ops._moe_C.remap_hidden_states(
++        hidden_states=x,
++        hidden_states_scales=None,
++        remapped_hidden_states=remapped,
++        remapped_hidden_states_scales=None,
++        expert_map=None,
++        rows_per_expert=rows_per_expert,
++        unpermuted_row_to_permuted_row=unpermuted,
++        topk_ids=topk_ids,
++        total_experts_num=E,
++        local_experts_num=E,
++    )
++    counts = rows_per_expert.tolist()
++    h = _xpu_grouped_proj(remapped, w1, weight_type, counts, group)
++    h = act(h)
++    h = _xpu_grouped_proj(h, w2, weight_type2, counts, group)
++    out = torch.empty_like(x)
++    torch.ops._moe_C.moe_gather(out, h, topk_weights, unpermuted, E)
++    return out
++
+ def _fused_moe_gguf(
+     x: torch.Tensor,
+     w1: torch.Tensor,
+@@ -52,9 +126,22 @@ def _fused_moe_gguf(
+ 
+     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+ 
++    import os
++
+     out_hidden_states = torch.empty_like(x)
++    # On XPU the SYCL kernel takes expert ids directly: no block alignment. Large batches
++    # (prefill) dequantize the active experts and use grouped matmuls instead.
++    use_sycl = ops.sycl_moe_available(x, weight_type) and ops.sycl_moe_available(x, weight_type2)
++    if (
++        x.device.type == "xpu"
++        and x.shape[0] > int(os.environ.get("VLLM_GGUF_XPU_PREFILL_MIN_TOKENS", "128"))
++    ):
++        return _xpu_grouped_moe(
++            x, w1, w2, topk_weights, topk_ids, weight_type, weight_type2, act
++        )
+     if (
+-        weight_type2 in MMQ_QUANT_TYPES
++        not use_sycl
++        and weight_type2 in MMQ_QUANT_TYPES
+         and weight_type in MMQ_QUANT_TYPES
+         and x.shape[0] > 64
+     ):
+diff --git a/vllm_gguf_plugin/quantization/linear.py b/vllm_gguf_plugin/quantization/linear.py
+index dcd7933258d8265127ce179f6a30d3bb812e48e0..bd2b6368729659de62b066c052a44b5688ffcd9a 100644
+--- a/vllm_gguf_plugin/quantization/linear.py
++++ b/vllm_gguf_plugin/quantization/linear.py
+@@ -32,6 +32,52 @@ from .utils import (
+ )
+ 
+ 
++def _dense_dequant_enabled() -> bool:
++    """VLLM_GGUF_DEQUANT_DENSE: 1 on, 0 off, auto (default) on for XPU."""
++    import os
++
++    mode = os.environ.get("VLLM_GGUF_DEQUANT_DENSE", "auto").lower()
++    if mode in ("1", "true", "on"):
++        return True
++    if mode in ("0", "false", "off"):
++        return False
++    from vllm.platforms import current_platform
++
++    return current_platform.is_xpu()
++
++
++def _fp8_dense_wanted(layer: torch.nn.Module) -> bool:
++    import os
++
++    if os.environ.get("VLLM_GGUF_DENSE_FORMAT", "bf16").lower() != "fp8":
++        return False
++    from vllm.platforms import current_platform
++
++    if not current_platform.is_xpu():
++        return False
++    if type(layer).__name__ == "ParallelLMHead":
++        return os.environ.get("VLLM_GGUF_FP8_LM_HEAD", "0") == "1"
++    return True
++
++
++def _convert_dense_to_fp8(layer: torch.nn.Module) -> None:
++    import vllm_xpu_kernels._xpu_C  # noqa: F401  (registers fp8_gemm_w8a16)
++
++    weight = layer.weight.data.float()  # [out, in], exact dequantized values
++    fmax = torch.finfo(torch.float8_e4m3fn).max
++    scale = (weight.abs().amax(dim=1, keepdim=True) / fmax).clamp_min(1e-12)
++    q = (weight / scale).clamp_(-fmax, fmax).to(torch.float8_e4m3fn)
++    del weight
++    # fp8_gemm_w8a16 takes the weight as an [in, out] view and a [1, out] scale.
++    layer.weight.data = q
++    layer.weight.data = layer.weight.data.t()
++    layer.register_parameter(
++        "gguf_fp8_scale",
++        torch.nn.Parameter(scale.t().contiguous().to(torch.float32), requires_grad=False),
++    )
++    layer.gguf_fp8_dense = True
++
++
+ def _fused_mul_mat_gguf(
+     x: torch.Tensor, weight: torch.Tensor, weight_type: int
+ ) -> torch.Tensor:
+@@ -160,6 +206,67 @@ class GGUFLinearMethod(LinearMethodBase):
+                 f"Unsupported GGUF quantization type {weight_type} in layer {layer}."
+             )
+         self._create_padded_weight_param(layer)
++        if _dense_dequant_enabled() and self._dense_dequant_applies(layer):
++            self._dequantize_dense_after_load(layer)
++
++    def _dense_dequant_applies(self, layer: torch.nn.Module) -> bool:
++        # The input embedding is a lookup: keep it quantized, rows are dequantized on demand.
++        return type(layer).__name__ != "VocabParallelEmbedding"
++
++    def _dequantize_dense_after_load(self, layer: torch.nn.Module) -> None:
++        weight = layer.weight
++        weight_type = layer.weight_type
++        dtype = getattr(self, "params_dtype", None) or torch.bfloat16
++        shard_ids = list(weight.shard_id) if weight.shard_id else []
++
++        def dequant(data: torch.Tensor, qtype: int) -> torch.Tensor:
++            if qtype in UNQUANTIZED_TYPES:
++                return data.to(dtype)
++            block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
++            rows = data.shape[0]
++            cols = data.shape[1] // type_size * block_size
++            out_dtype = torch.float32 if _fp8_dense_wanted(layer) else dtype
++            parts = [
++                ops.ggml_dequantize(data[i:i + 16384].contiguous(), qtype,
++                                    min(16384, rows - i), cols, out_dtype)
++                for i in range(0, rows, 16384)
++            ]
++            return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
++
++        if shard_ids and getattr(weight, "shard_offset_map", None):
++            parts = []
++            for idx in shard_ids:
++                start, end, size = weight.shard_offset_map[idx]
++                qtype = weight_type.shard_weight_type.get(idx, weight_type.weight_type)
++                parts.append(dequant(weight.data[start:end, :size], qtype))
++            dense = torch.cat(parts, dim=0)
++        else:
++            qtype = weight_type.weight_type
++            if qtype in UNQUANTIZED_TYPES:
++                return
++            dense = dequant(weight.data, qtype)
++
++        new_param = GGUFWeightParameter(
++            data=dense,
++            weight_loader=weight.weight_loader,
++            input_dim=weight.input_dim,
++            output_dim=weight.output_dim,
++            tensor_shape=weight.tensor_shape,
++        )
++        new_param.data_container = []
++        new_param.shard_id = shard_ids
++        new_param.shard_id_map = dict(getattr(weight, "shard_id_map", {}))
++        if hasattr(weight, "ignore_warning"):
++            new_param.ignore_warning = weight.ignore_warning
++        if getattr(weight, "shard_offset_map", None):
++            set_weight_attrs(new_param, {"shard_offset_map": dict(weight.shard_offset_map)})
++        layer.register_parameter("weight", new_param)
++        if _fp8_dense_wanted(layer):
++            _convert_dense_to_fp8(layer)
++        dense_type = int(WeightType.BF16 if dtype == torch.bfloat16 else WeightType.F16)
++        weight_type.weight_type = dense_type
++        for idx in list(weight_type.shard_weight_type):
++            weight_type.shard_weight_type[idx] = dense_type
+ 
+     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
+         self._materialize_weight(layer)
+@@ -229,6 +336,13 @@ class GGUFLinearMethod(LinearMethodBase):
+         if self.layout is not None:
+             x = self.layout.input_to_gguf(x)
+ 
++        if getattr(layer, "gguf_fp8_dense", False):
++            shape = x.shape
++            y = torch.ops._xpu_C.fp8_gemm_w8a16(
++                x.reshape(-1, shape[-1]), layer.weight, layer.gguf_fp8_scale, bias
++            )
++            return y.view(*shape[:-1], y.shape[-1])
++
+         shard_id = layer.weight.shard_id
+         if shard_id:
+             shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+diff --git a/vllm_gguf_plugin/triton/dequantize/utils.py b/vllm_gguf_plugin/triton/dequantize/utils.py
+index c6460bb5884317af212fdbe7b771f2358067450e..e614d7f6fd01a1e9b1db1dad4fcc6cfc34d17acf 100644
+--- a/vllm_gguf_plugin/triton/dequantize/utils.py
++++ b/vllm_gguf_plugin/triton/dequantize/utils.py
+@@ -78,8 +78,8 @@ def validate_dequant_args(
+     quant_type = int(quant_type)
+     if quant_type not in TRITON_DEQUANT_SUPPORTED_TYPES:
+         raise ValueError(f"Unsupported Triton dequant quant type: {quant_type}")
+-    if not W.is_cuda:
+-        raise ValueError("Triton dequant kernels require CUDA tensors")
++    if not (W.device.type in ("cuda", "xpu")):
++        raise ValueError("Triton dequant kernels require CUDA or XPU tensors")
+     if W.dtype is not torch.uint8:
+         raise TypeError(f"Quantized weights must be torch.uint8, got {W.dtype}")
+ 
+diff --git a/vllm_gguf_plugin/triton/fused_moe/utils.py b/vllm_gguf_plugin/triton/fused_moe/utils.py
+index dfdd0064caf735c868155247b087360f3d670343..bc87119025f85e1a8089db3f7da4a32f5134f887 100644
+--- a/vllm_gguf_plugin/triton/fused_moe/utils.py
++++ b/vllm_gguf_plugin/triton/fused_moe/utils.py
+@@ -155,9 +155,9 @@ def _validate_args(
+     if quant_type not in TRITON_FUSED_MOE_SUPPORTED_TYPES:
+         raise ValueError(f"Unsupported Triton fused MoE quant type: {quant_type}")
+     if not all(
+-        t.is_cuda for t in (W, X, sorted_token_ids, expert_ids, num_tokens_post_padded)
++        (t.device.type in ("cuda", "xpu")) for t in (W, X, sorted_token_ids, expert_ids, num_tokens_post_padded)
+     ):
+-        raise ValueError("Triton fused MoE kernels require CUDA tensors")
++        raise ValueError("Triton fused MoE kernels require CUDA or XPU tensors")
+     if W.dtype is not torch.uint8:
+         raise TypeError(f"Quantized expert weights must be torch.uint8, got {W.dtype}")
+     if X.dtype not in TRITON_SUPPORTED_ACTIVATION_DTYPES:
+diff --git a/vllm_gguf_plugin/triton/gemm/standard_quant/q4_0.py b/vllm_gguf_plugin/triton/gemm/standard_quant/q4_0.py
+index a299281c09ad5f4b6b1b4f9d75eb72912632d7ac..ac438c9204604ac33c5ecce1f89ca9802c0537a7 100644
+--- a/vllm_gguf_plugin/triton/gemm/standard_quant/q4_0.py
++++ b/vllm_gguf_plugin/triton/gemm/standard_quant/q4_0.py
+@@ -99,7 +99,7 @@ def ggml_gemm_q4_0_triton(
+     X: torch.Tensor,
+     row: int,
+ ) -> torch.Tensor:
+-    if not W.is_cuda or not X.is_cuda:
++    if not (W.device.type in ("cuda", "xpu")) or not (X.device.type in ("cuda", "xpu")):
+         raise ValueError("Q4_0 Triton kernel requires CUDA tensors")
+     if W.dtype is not torch.uint8:
+         raise TypeError(f"Q4_0 weights must be torch.uint8, got {W.dtype}")
+diff --git a/vllm_gguf_plugin/triton/gemm/utils.py b/vllm_gguf_plugin/triton/gemm/utils.py
+index 6cd3243d28b35306cb5e2c90af31b8ea9c16de4e..9a401e54a16c38965bd083bab0cde7a6f1afcc25 100644
+--- a/vllm_gguf_plugin/triton/gemm/utils.py
++++ b/vllm_gguf_plugin/triton/gemm/utils.py
+@@ -227,8 +227,8 @@ def _validate_args(
+ ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...], int]:
+     if quant_type not in TRITON_SUPPORTED_TYPES:
+         raise ValueError(f"Unsupported Triton quant type: {quant_type}")
+-    if not W.is_cuda or not X.is_cuda:
+-        raise ValueError("Triton kernels require CUDA tensors")
++    if not (W.device.type in ("cuda", "xpu")) or not (X.device.type in ("cuda", "xpu")):
++        raise ValueError("Triton kernels require CUDA or XPU tensors")
+     if W.dtype is not torch.uint8:
+         raise TypeError(f"Quantized weights must be torch.uint8, got {W.dtype}")
+     if X.dtype not in TRITON_SUPPORTED_ACTIVATION_DTYPES:
+diff --git a/vllm_gguf_plugin/weights_adapter/diffusion/loader.py b/vllm_gguf_plugin/weights_adapter/diffusion/loader.py
+index 070047dceac746d8b9ea0b6c97034f0acbbab54f..f68833f943186d28cdb22ac6922d64d8b53885c5 100644
+--- a/vllm_gguf_plugin/weights_adapter/diffusion/loader.py
++++ b/vllm_gguf_plugin/weights_adapter/diffusion/loader.py
+@@ -126,7 +126,7 @@ def _dense_weight_from_gguf_weight(
+     if qtype in UNQUANTIZED_TYPES:
+         return weight
+ 
+-    if not weight.is_cuda:
++    if not (weight.device.type in ("cuda", "xpu")):
+         weight = dequantize(weight.detach().cpu().numpy(), qtype)
+         return torch.from_numpy(weight).to(dtype=torch.float32)
+ 
+diff --git a/vllm_gguf_plugin/weights_adapter/qwen3_5.py b/vllm_gguf_plugin/weights_adapter/qwen3_5.py
+index 30797aeb494a6a705ad2465ccba7633d5f63836d..7d15ffb9d09371d5224a40d17556c81c13eb93e8 100644
+--- a/vllm_gguf_plugin/weights_adapter/qwen3_5.py
++++ b/vllm_gguf_plugin/weights_adapter/qwen3_5.py
+@@ -380,6 +380,17 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
+         yield from split_stacked_experts(transformed())
+ 
+ 
++def _is_moe_mtp(hf_config) -> bool:
++    # vLLM relabels every Qwen3.5 draft as model_type "qwen3_5_mtp"; MoE drafts keep
++    # the "Qwen3_5MoeMTP" architecture and the expert count in their text config.
++    if hf_config.model_type in QWEN35_MOE_MTP_MODEL_TYPES:
++        return True
++    if "Qwen3_5MoeMTP" in (getattr(hf_config, "architectures", None) or []):
++        return True
++    text_config = hf_config.get_text_config() if hasattr(hf_config, "get_text_config") else hf_config
++    return bool(getattr(text_config, "num_experts", 0))
++
++
+ class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
+     """Qwen3.5/3.6 single-block MTP draft stored in a GGUF nextn block."""
+ 
+@@ -404,10 +415,7 @@ class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
+             )
+         tensor_names = sorted(get_gguf_tensor_names(files.backbone))
+         logger.info("Loading Qwen3.5 MTP draft from GGUF block %d", block_index)
+-        mapper = build_qwen35_mtp_mapper(
+-            block_index,
+-            is_moe=model_config.hf_config.model_type in QWEN35_MOE_MTP_MODEL_TYPES,
+-        )
++        mapper = build_qwen35_mtp_mapper(block_index, is_moe=_is_moe_mtp(model_config.hf_config))
+         block_prefix = f"blk.{block_index}."
+         name_map: dict[str, str] = {}
+         unmapped: list[str] = []
+diff --git a/vllm_gguf_plugin/xpu_kernels/__init__.py b/vllm_gguf_plugin/xpu_kernels/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f50e0721303ce7dfd25a15bb44732083e756e309
+--- /dev/null
++++ b/vllm_gguf_plugin/xpu_kernels/__init__.py
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: Apache-2.0
++"""SYCL GGUF kernels for Intel XPU. Rebuild with build_gguf_xpu.py (icpx matching the SYCL runtime)."""
++import os
++from pathlib import Path
++
++import torch
++
++SYCL_MOE_TYPES = frozenset({11, 12, 13, 14})  # Q3_K, Q4_K, Q5_K, Q6_K
++_loaded = None
++
++
++def available() -> bool:
++    """Load gguf_xpu_moe.so once; VLLM_GGUF_XPU_KERNELS=0 disables it."""
++    global _loaded
++    if _loaded is None:
++        _loaded = False
++        if os.environ.get("VLLM_GGUF_XPU_KERNELS", "1") != "0" and hasattr(torch, "xpu") and torch.xpu.is_available():
++            library = Path(os.environ.get("VLLM_GGUF_XPU_KERNEL_LIB", Path(__file__).with_name("gguf_xpu_moe.so")))
++            try:
++                torch.ops.load_library(str(library))
++                _register_fake()
++                _loaded = True
++            except (OSError, RuntimeError):
++                _loaded = False
++    return _loaded
++
++
++def _register_fake() -> None:
++    from torch.library import register_fake
++
++    @register_fake("gguf_xpu::moe_vec")
++    def _moe_vec_fake(x, w, ids, top_k, qtype, rows):
++        return torch.empty((x.shape[0] * top_k, rows), dtype=x.dtype, device=x.device)
++
++
++def moe_vec(x, w, topk_ids, top_k: int, qtype: int, rows: int):
++    return torch.ops.gguf_xpu.moe_vec(x, w, topk_ids, top_k, qtype, rows)
+diff --git a/vllm_gguf_plugin/xpu_kernels/build_gguf_xpu.py b/vllm_gguf_plugin/xpu_kernels/build_gguf_xpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9d53da9764f233e6aa41011c1c03716c15ba226
+--- /dev/null
++++ b/vllm_gguf_plugin/xpu_kernels/build_gguf_xpu.py
+@@ -0,0 +1,22 @@
++"""Build the GGUF XPU MoE kernel as a torch op library (icpx 2026.0 = the container's SYCL runtime)."""
++import os
++import pathlib
++
++compiler = '/opt/intel/oneapi/compiler/2026.0'
++os.environ['CXX'] = compiler + '/bin/icpx'
++os.environ['PATH'] = compiler + '/bin:' + os.environ['PATH']
++os.environ['MAX_JOBS'] = '4'
++os.environ['TORCH_XPU_ARCH_LIST'] = ''
++
++import torch  # noqa: E402
++from torch.utils.cpp_extension import load  # noqa: E402
++
++root = pathlib.Path(__file__).resolve().parent
++build = root / 'kernel-build'
++build.mkdir(exist_ok=True)
++load(name='gguf_xpu_moe', sources=[str(root / 'gguf_xpu_moe.cpp')],
++     extra_cflags=['-O3', '-fsycl', '-Wno-deprecated-declarations'],
++     extra_ldflags=['-fsycl', '-ltorch_xpu', '-lc10_xpu'],
++     with_sycl=False, is_python_module=False, build_directory=str(build), verbose=False)
++assert not torch.xpu.is_initialized()
++print('BUILT', build / 'gguf_xpu_moe.so')
+diff --git a/vllm_gguf_plugin/xpu_kernels/gguf_xpu_moe.cpp b/vllm_gguf_plugin/xpu_kernels/gguf_xpu_moe.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f321d663f4a1619d69387af1e3b18cdb3f27ef75
+--- /dev/null
++++ b/vllm_gguf_plugin/xpu_kernels/gguf_xpu_moe.cpp
+@@ -0,0 +1,253 @@
++// SYCL kernel for GGUF k-quant MoE projections on Intel XPU (vLLM XPU + vllm-gguf-plugin).
++//
++// gguf_xpu::moe_vec(x, w, ids, top_k, qtype, rows) -> y
++//   x   [N, in]            float input rows
++//   w   [E, rows, bytes]   uint8 GGUF blocks, one row of blocks per output row
++//   ids [N * top_k] or [T, K] expert per (token, slot), flattened row-major
++//   y   [N * top_k, rows]  y[p] = W[ids[p]] @ x[p / top_k]
++// Each output element dequantizes one row of blocks and takes its dot product with the input in
++// float32, so the result equals an exact ggml dequantization followed by a matmul.
++// Block layouts and per-value formulas follow ggml (QK_K = 256).
++#include <limits>
++
++#include <sycl/sycl.hpp>
++#include <torch/extension.h>
++#include <c10/xpu/XPUStream.h>
++
++namespace {
++
++constexpr int QK_K = 256;
++constexpr int64_t TYPE_Q3_K = 11, TYPE_Q4_K = 12, TYPE_Q5_K = 13, TYPE_Q6_K = 14;
++
++inline float fp16_to_float(uint8_t lo, uint8_t hi) {
++  uint16_t h = static_cast<uint16_t>(lo) | (static_cast<uint16_t>(hi) << 8);
++  int sign = (h >> 15) & 1;
++  int exp = (h >> 10) & 0x1F;
++  int mant = h & 0x3FF;
++  float v;
++  if (exp == 0) {
++    v = sycl::ldexp(static_cast<float>(mant), -24);           // subnormal: mant * 2^-24
++  } else if (exp == 31) {
++    v = mant ? sycl::nan(0u) : std::numeric_limits<float>::infinity();
++  } else {
++    v = sycl::ldexp(static_cast<float>(mant | 0x400), exp - 25);  // (1024 + mant) * 2^(exp-25)
++  }
++  return sign ? -v : v;
++}
++
++inline void scale_min_k4(int j, const uint8_t *q, int &d, int &m) {
++  if (j < 4) {
++    d = q[j] & 63;
++    m = q[j + 4] & 63;
++  } else {
++    d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
++    m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
++  }
++}
++
++// Q4_K: d(2) dmin(2) scales(12) qs(128) = 144 bytes
++inline float dot_q4_k(const uint8_t *blk, const float *x) {
++  const float d = fp16_to_float(blk[0], blk[1]);
++  const float dmin = fp16_to_float(blk[2], blk[3]);
++  const uint8_t *scales = blk + 4;
++  const uint8_t *qs = blk + 16;
++  float acc = 0.0f;
++  for (int il = 0; il < 4; ++il) {
++    int sc, m;
++    scale_min_k4(2 * il, scales, sc, m);
++    const float d1 = d * sc, m1 = dmin * m;
++    scale_min_k4(2 * il + 1, scales, sc, m);
++    const float d2 = d * sc, m2 = dmin * m;
++    const uint8_t *q = qs + 32 * il;
++    const float *xa = x + 64 * il;
++    const float *xb = xa + 32;
++    float s1 = 0.0f, t1 = 0.0f, s2 = 0.0f, t2 = 0.0f;
++    for (int l = 0; l < 32; ++l) {
++      s1 += xa[l] * static_cast<float>(q[l] & 0xF);
++      t1 += xa[l];
++      s2 += xb[l] * static_cast<float>(q[l] >> 4);
++      t2 += xb[l];
++    }
++    acc += d1 * s1 - m1 * t1 + d2 * s2 - m2 * t2;
++  }
++  return acc;
++}
++
++// Q5_K: d(2) dmin(2) scales(12) qh(32) qs(128) = 176 bytes
++inline float dot_q5_k(const uint8_t *blk, const float *x) {
++  const float d = fp16_to_float(blk[0], blk[1]);
++  const float dmin = fp16_to_float(blk[2], blk[3]);
++  const uint8_t *scales = blk + 4;
++  const uint8_t *qh = blk + 16;
++  const uint8_t *qs = blk + 48;
++  float acc = 0.0f;
++  for (int il = 0; il < 4; ++il) {
++    int sc, m;
++    scale_min_k4(2 * il, scales, sc, m);
++    const float d1 = d * sc, m1 = dmin * m;
++    scale_min_k4(2 * il + 1, scales, sc, m);
++    const float d2 = d * sc, m2 = dmin * m;
++    const uint8_t u1 = static_cast<uint8_t>(1 << (2 * il));
++    const uint8_t u2 = static_cast<uint8_t>(2 << (2 * il));
++    const uint8_t *q = qs + 32 * il;
++    const float *xa = x + 64 * il;
++    const float *xb = xa + 32;
++    float s1 = 0.0f, t1 = 0.0f, s2 = 0.0f, t2 = 0.0f;
++    for (int l = 0; l < 32; ++l) {
++      const int v1 = (q[l] & 0xF) + ((qh[l] & u1) ? 16 : 0);
++      const int v2 = (q[l] >> 4) + ((qh[l] & u2) ? 16 : 0);
++      s1 += xa[l] * static_cast<float>(v1);
++      t1 += xa[l];
++      s2 += xb[l] * static_cast<float>(v2);
++      t2 += xb[l];
++    }
++    acc += d1 * s1 - m1 * t1 + d2 * s2 - m2 * t2;
++  }
++  return acc;
++}
++
++// Q6_K: ql(128) qh(64) scales(16, int8) d(2) = 210 bytes
++inline float dot_q6_k(const uint8_t *blk, const float *x) {
++  const uint8_t *ql = blk;
++  const uint8_t *qh = blk + 128;
++  const int8_t *sc = static_cast<const int8_t *>(static_cast<const void *>(blk + 192));
++  const float d = fp16_to_float(blk[208], blk[209]);
++  float acc = 0.0f;
++  // element e = 128*ip + 32*h + il; qh byte qh[32*ip + il]; scale sc[8*ip + il/16 + 2*h]
++  for (int ip = 0; ip < 2; ++ip) {
++    for (int h = 0; h < 4; ++h) {
++      const float *xs = x + 128 * ip + 32 * h;
++      const uint8_t *qb = ql + 64 * ip + 32 * (h & 1);
++      const uint8_t *hb = qh + 32 * ip;
++      const int shift = 2 * h;
++      for (int half = 0; half < 2; ++half) {
++        const float scale = d * sc[8 * ip + half + 2 * h];
++        float s = 0.0f;
++        for (int il = 16 * half; il < 16 * half + 16; ++il) {
++          const int low = (h < 2) ? (qb[il] & 0xF) : (qb[il] >> 4);
++          const int hi = (hb[il] >> shift) & 3;
++          s += xs[il] * static_cast<float>((low | (hi << 4)) - 32);
++        }
++        acc += scale * s;
++      }
++    }
++  }
++  return acc;
++}
++
++// Q3_K: hmask(32) qs(64) scales(12) d(2) = 110 bytes
++inline int q3_k_scale(int is, const uint8_t *s) {
++  if (is < 4) return (s[is] & 0xF) | (((s[is + 8] >> 0) & 3) << 4);
++  if (is < 8) return (s[is] & 0xF) | (((s[is + 4] >> 2) & 3) << 4);
++  if (is < 12) return (s[is - 8] >> 4) | (((s[is] >> 4) & 3) << 4);
++  return (s[is - 8] >> 4) | (((s[is - 4] >> 6) & 3) << 4);
++}
++
++inline float dot_q3_k(const uint8_t *blk, const float *x) {
++  const uint8_t *hm = blk;
++  const uint8_t *qs = blk + 32;
++  const uint8_t *scales = blk + 96;
++  const float d = fp16_to_float(blk[108], blk[109]);
++  float acc = 0.0f;
++  // element e = 128*n + 32*j + l; is = 8n + 2j + l/16; bit m = 1 << (4n + j); shift 2j
++  for (int n = 0; n < 2; ++n) {
++    const uint8_t *q = qs + 32 * n;
++    for (int j = 0; j < 4; ++j) {
++      const float *xs = x + 128 * n + 32 * j;
++      const uint8_t mbit = static_cast<uint8_t>(1 << (4 * n + j));
++      const int shift = 2 * j;
++      for (int half = 0; half < 2; ++half) {
++        const float dl = d * static_cast<float>(q3_k_scale(8 * n + 2 * j + half, scales) - 32);
++        float s = 0.0f;
++        for (int l = 16 * half; l < 16 * half + 16; ++l) {
++          const int v = ((q[l] >> shift) & 3) - ((hm[l] & mbit) ? 0 : 4);
++          s += xs[l] * static_cast<float>(v);
++        }
++        acc += dl * s;
++      }
++    }
++  }
++  return acc;
++}
++
++int64_t block_bytes(int64_t qtype) {
++  switch (qtype) {
++    case TYPE_Q3_K: return 110;
++    case TYPE_Q4_K: return 144;
++    case TYPE_Q5_K: return 176;
++    case TYPE_Q6_K: return 210;
++    default: return 0;
++  }
++}
++
++template <typename DotFn>
++void run_moe(sycl::queue &q, const float *x, const uint8_t *w, const int32_t *ids, float *y,
++             int64_t pairs, int64_t rows, int64_t top_k, int64_t in_features, int64_t nblk,
++             int64_t bsize, int64_t stride_e, int64_t stride_r, DotFn dot) {
++  q.parallel_for(sycl::range<2>(pairs, rows), [=](sycl::item<2> it) {
++     const int64_t p = it[0];
++     const int64_t r = it[1];
++     const int64_t e = ids[p];
++     const float *xr = x + (p / top_k) * in_features;
++     const uint8_t *row = w + e * stride_e + r * stride_r;
++     float acc = 0.0f;
++     for (int64_t b = 0; b < nblk; ++b) acc += dot(row + b * bsize, xr + b * QK_K);
++     y[p * rows + r] = acc;
++   });
++}
++
++torch::Tensor moe_vec(torch::Tensor x, torch::Tensor w, torch::Tensor ids, int64_t top_k,
++                      int64_t qtype, int64_t rows) {
++  TORCH_CHECK(x.device().is_xpu() && w.device().is_xpu() && ids.device().is_xpu(), "XPU tensors required");
++  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3, "w must be uint8 [E, rows, bytes]");
++  const int64_t bsize = block_bytes(qtype);
++  TORCH_CHECK(bsize > 0, "unsupported GGUF type ", qtype);
++  TORCH_CHECK(w.size(1) == rows && w.size(2) % bsize == 0, "bad weight shape");
++  const int64_t nblk = w.size(2) / bsize;
++  const int64_t in_features = nblk * QK_K;
++  TORCH_CHECK(x.dim() == 2 && x.size(1) == in_features, "x must be [N, ", in_features, "]");
++  const auto out_dtype = x.dtype();
++  auto xf = x.to(torch::kFloat32).contiguous();
++  auto wc = w.contiguous();
++  auto idf = ids.to(torch::kInt32).reshape({-1}).contiguous();
++  const int64_t pairs = x.size(0) * top_k;
++  TORCH_CHECK(idf.numel() == pairs, "ids has ", idf.numel(), " entries, expected ", pairs);
++  auto y = torch::empty({pairs, rows}, xf.options());
++  if (pairs == 0) return y.to(out_dtype);
++  auto &queue = c10::xpu::getCurrentXPUStream(x.device().index()).queue();
++  const float *xp = xf.data_ptr<float>();
++  const uint8_t *wp = wc.data_ptr<uint8_t>();
++  const int32_t *ip = idf.data_ptr<int32_t>();
++  float *yp = y.data_ptr<float>();
++  const int64_t stride_e = wc.stride(0), stride_r = wc.stride(1);
++  // Lambdas, not function pointers: device code cannot make indirect calls.
++  switch (qtype) {
++    case TYPE_Q3_K:
++      run_moe(queue, xp, wp, ip, yp, pairs, rows, top_k, in_features, nblk, bsize, stride_e, stride_r,
++              [](const uint8_t *b, const float *v) { return dot_q3_k(b, v); });
++      break;
++    case TYPE_Q4_K:
++      run_moe(queue, xp, wp, ip, yp, pairs, rows, top_k, in_features, nblk, bsize, stride_e, stride_r,
++              [](const uint8_t *b, const float *v) { return dot_q4_k(b, v); });
++      break;
++    case TYPE_Q5_K:
++      run_moe(queue, xp, wp, ip, yp, pairs, rows, top_k, in_features, nblk, bsize, stride_e, stride_r,
++              [](const uint8_t *b, const float *v) { return dot_q5_k(b, v); });
++      break;
++    case TYPE_Q6_K:
++      run_moe(queue, xp, wp, ip, yp, pairs, rows, top_k, in_features, nblk, bsize, stride_e, stride_r,
++              [](const uint8_t *b, const float *v) { return dot_q6_k(b, v); });
++      break;
++  }
++  return y.to(out_dtype);
++}
++
++}  // namespace
++
++TORCH_LIBRARY(gguf_xpu, m) {
++  m.def("moe_vec(Tensor x, Tensor w, Tensor ids, int top_k, int qtype, int rows) -> Tensor");
++}
++
++TORCH_LIBRARY_IMPL(gguf_xpu, XPU, m) {
++  m.impl("moe_vec", &moe_vec);
++}

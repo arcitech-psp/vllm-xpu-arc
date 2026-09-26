@@ -1,0 +1,25 @@
+# Never commit model weights, runtime caches, build products, or credentials.
+*.gguf
+*.safetensors
+*.bin
+*.so
+*.o
+*.a
+*.npz
+*.log
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+kernel-build/
+*-build/
+cache/
+triton-cache/
+inductor-cache/
+.env
+.env.*
+*.key
+*token*
+*secret*

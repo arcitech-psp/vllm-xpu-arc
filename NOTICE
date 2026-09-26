@@ -1,0 +1,13 @@
+vLLM XPU Arc extensions
+
+This repository contains Apache-2.0 derived work and patches for:
+
+* vLLM, upstream commit ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9.
+* vllm-gguf-plugin, upstream main commit d4c1f0d082fc7cd4350da56689109a01c1f29d6c,
+  with the XPU extension commit 56bfc18.
+* oneDNN APIs and build integration. The oneDNN source is an external build
+  dependency and is not vendored here.
+
+Copyright notices and license files shipped by those projects remain with the
+corresponding source trees. New code in this repository is offered under the
+Apache License, Version 2.0, subject to confirmation by the copyright holder.

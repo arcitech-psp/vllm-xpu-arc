@@ -1,0 +1,625 @@
+diff --git a/vllm/_xpu_ops.py b/vllm/_xpu_ops.py
+index aea1785897..f88745ea9f 100644
+--- a/vllm/_xpu_ops.py
++++ b/vllm/_xpu_ops.py
+@@ -5,6 +5,12 @@ from collections.abc import Callable
+ from typing import TYPE_CHECKING
+ 
+ import torch
++import os
++if os.environ.get("VLLM_XPU_ADAPTIVE_MTP") == "1":
++    torch.ops.load_library(os.environ.get(
++        "VLLM_XPU_ADAPTIVE_GDN_LIBRARY",
++        "/opt/vllm-xpu-arc/adaptive/kernel-build/vllm_xpu_adaptive_gdn.so",
++    ))
+ from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
+ 
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+@@ -168,37 +171,171 @@ def _gdn_attention_core_xpu_impl(
+         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+     )
+ 
+-    torch.ops._xpu_C.gdn_attention(
+-        core_attn_out,
+-        z,
+-        projected_states_qkvz,
+-        projected_states_ba,
+-        self.num_k_heads,
+-        self.num_v_heads,
+-        self.head_k_dim,
+-        self.head_v_dim,
+-        conv_state=self.kv_cache[0],
+-        ssm_state=self.kv_cache[1],
+-        conv_weights=conv_weights,
+-        conv_bias=self.conv1d.bias,
+-        activation=self.activation,
+-        A_log=self.A_log,
+-        dt_bias=self.dt_bias,
+-        num_prefills=num_prefills,  # type: ignore[attr-defined]
+-        num_decodes=num_decodes,  # type: ignore[attr-defined]
+-        num_spec_decodes=num_spec_decodes,  # type: ignore[attr-defined]
+-        has_initial_state=has_initial_state,  # type: ignore[attr-defined]
+-        non_spec_query_start_loc=non_spec_query_start_loc,  # type: ignore[attr-defined]
+-        non_spec_token_indx=non_spec_token_indx,  # type: ignore[attr-defined]
+-        non_spec_state_indices_tensor=non_spec_state_indices_tensor,  # type: ignore[attr-defined]
+-        spec_query_start_loc=spec_query_start_loc,  # type: ignore[attr-defined]
+-        spec_token_indx=spec_token_indx,  # type: ignore[attr-defined]
+-        spec_state_indices_tensor=spec_state_indices_tensor,
+-        num_accepted_tokens=num_accepted_tokens,  # type: ignore[attr-defined]
+-        num_actual_tokens=num_actual_tokens,  # type: ignore[attr-defined]
+-        tp_size=self.tp_size,
+-        reorder_input=not self.gqa_interleaved_layout,
++    # VLLM_XPU_GDN_MIXED_SPLIT_V5: fused XPU causal_conv1d is exclusive
++    # (spec XOR non-spec). Compact + two fused calls + scatter z/out.
++    # Homogeneous batches keep the single call (C1 MTP / no-spec).
++    _mixed = (
++        num_spec_decodes > 0
++        and (num_prefills + num_decodes) > 0
++        and non_spec_token_indx is not None
++        and spec_token_indx is not None
+     )
++    _reorder = not self.gqa_interleaved_layout
++
++    def _invoke(
++        _out,
++        _z,
++        _qkvz,
++        _ba,
++        *,
++        n_pref,
++        n_dec,
++        n_spec,
++        n_tok,
++        has_init,
++        ns_loc,
++        ns_idx,
++        ns_state,
++        sp_loc,
++        sp_idx,
++        sp_state,
++        n_acc,
++    ):
++        _gdn_op = (torch.ops.vllm_xpu_adaptive.gdn_attention
++                   if n_spec > 0 and os.environ.get("VLLM_XPU_ADAPTIVE_MTP") == "1"
++                   else torch.ops._xpu_C.gdn_attention)
++        _gdn_op(
++            _out,
++            _z,
++            _qkvz,
++            _ba,
++            self.num_k_heads,
++            self.num_v_heads,
++            self.head_k_dim,
++            self.head_v_dim,
++            conv_state=self.kv_cache[0],
++            ssm_state=self.kv_cache[1],
++            conv_weights=conv_weights,
++            conv_bias=self.conv1d.bias,
++            activation=self.activation,
++            A_log=self.A_log,
++            dt_bias=self.dt_bias,
++            num_prefills=n_pref,
++            num_decodes=n_dec,
++            num_spec_decodes=n_spec,
++            has_initial_state=has_init,
++            non_spec_query_start_loc=ns_loc,
++            non_spec_token_indx=ns_idx,
++            non_spec_state_indices_tensor=ns_state,
++            spec_query_start_loc=sp_loc,
++            spec_token_indx=sp_idx,
++            spec_state_indices_tensor=sp_state,
++            num_accepted_tokens=n_acc,
++            num_actual_tokens=n_tok,
++            tp_size=self.tp_size,
++            reorder_input=_reorder,
++        )
++
++    if not _mixed:
++        _invoke(
++            core_attn_out,
++            z,
++            projected_states_qkvz,
++            projected_states_ba,
++            n_pref=num_prefills,
++            n_dec=num_decodes,
++            n_spec=num_spec_decodes,
++            n_tok=num_actual_tokens,
++            has_init=has_initial_state,
++            ns_loc=non_spec_query_start_loc,
++            ns_idx=non_spec_token_indx,
++            ns_state=non_spec_state_indices_tensor,
++            sp_loc=spec_query_start_loc,
++            sp_idx=spec_token_indx,
++            sp_state=spec_state_indices_tensor,
++            n_acc=num_accepted_tokens,
++        )
++        return
++
++    def _i32(t):
++        if t is None:
++            return None
++        if t.dtype != torch.int32:
++            t = t.to(torch.int32)
++        return t.contiguous()
++
++    _nsti = _i32(non_spec_token_indx)
++    _sti = _i32(spec_token_indx)
++    _n_ns = int(_nsti.numel())
++    _n_sp = int(_sti.numel())
++    _dev = core_attn_out.device
++    if not getattr(self, "_vllm_xpu_gdn_split_logged", False):
++        logger.info(
++            "[vllm-xpu] GDN mixed split prefill=%d decode=%d spec=%d n_ns=%d n_sp=%d",
++            num_prefills,
++            num_decodes,
++            num_spec_decodes,
++            _n_ns,
++            _n_sp,
++        )
++        self._vllm_xpu_gdn_split_logged = True
++
++    def _compact(src, idx):
++        return src.index_select(0, idx.to(torch.long)).contiguous()
++
++    if _n_ns > 0:
++        _z_ns = _compact(z, _nsti)
++        _qkvz_ns = _compact(projected_states_qkvz, _nsti)
++        _ba_ns = _compact(projected_states_ba, _nsti)
++        _out_ns = core_attn_out.new_empty((_n_ns,) + tuple(core_attn_out.shape[1:]))
++        _ar_ns = torch.arange(_n_ns, dtype=torch.int32, device=_dev)
++        _invoke(
++            _out_ns,
++            _z_ns,
++            _qkvz_ns,
++            _ba_ns,
++            n_pref=num_prefills,
++            n_dec=num_decodes,
++            n_spec=0,
++            n_tok=_n_ns,
++            has_init=has_initial_state,
++            ns_loc=non_spec_query_start_loc,
++            ns_idx=_ar_ns,
++            ns_state=non_spec_state_indices_tensor,
++            sp_loc=None,
++            sp_idx=None,
++            sp_state=None,
++            n_acc=None,
++        )
++        core_attn_out.index_copy_(0, _nsti.to(torch.long), _out_ns)
++        z.index_copy_(0, _nsti.to(torch.long), _z_ns)
++
++    if _n_sp > 0:
++        _z_sp = _compact(z, _sti)
++        _qkvz_sp = _compact(projected_states_qkvz, _sti)
++        _ba_sp = _compact(projected_states_ba, _sti)
++        _out_sp = core_attn_out.new_empty((_n_sp,) + tuple(core_attn_out.shape[1:]))
++        _ar_sp = torch.arange(_n_sp, dtype=torch.int32, device=_dev)
++        _invoke(
++            _out_sp,
++            _z_sp,
++            _qkvz_sp,
++            _ba_sp,
++            n_pref=0,
++            n_dec=0,
++            n_spec=num_spec_decodes,
++            n_tok=_n_sp,
++            has_init=None,
++            ns_loc=None,
++            ns_idx=None,
++            ns_state=None,
++            sp_loc=spec_query_start_loc,
++            sp_idx=_ar_sp,
++            sp_state=spec_state_indices_tensor,
++            n_acc=num_accepted_tokens,
++        )
++        core_attn_out.index_copy_(0, _sti.to(torch.long), _out_sp)
++        z.index_copy_(0, _sti.to(torch.long), _z_sp)
+ 
+ 
+ def _gdn_attention_core_xpu_fake(
+diff --git a/vllm/model_executor/kernels/linear/mxfp4/xpu.py b/vllm/model_executor/kernels/linear/mxfp4/xpu.py
+index c499d0a17a..4c6b2877b8 100644
+--- a/vllm/model_executor/kernels/linear/mxfp4/xpu.py
++++ b/vllm/model_executor/kernels/linear/mxfp4/xpu.py
+@@ -1,8 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ import torch
+ 
++if os.environ.get("VLLM_XPU_MXFP4_W4A16") == "1":
++    from mxfp4_w4a16_runtime import apply_w4a16
++
+ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+     xpu_mxfp4_quantize as quant_mxfp4,
+ )
+@@ -46,6 +50,8 @@ class XPUMxFp4LinearKernel(MxFp4LinearKernel):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if os.environ.get("VLLM_XPU_MXFP4_W4A16") == "1":
++            return apply_w4a16(layer, x, bias)
+         out_dtype = x.dtype
+         x_fp4, x_blockscale = quant_mxfp4(x)
+         return torch.ops._xpu_C.fp4_gemm(
+diff --git a/vllm/model_executor/layers/mamba/mamba_utils.py b/vllm/model_executor/layers/mamba/mamba_utils.py
+index 50f6e059c0..7d21bfa9c5 100644
+--- a/vllm/model_executor/layers/mamba/mamba_utils.py
++++ b/vllm/model_executor/layers/mamba/mamba_utils.py
+@@ -384,6 +384,15 @@ class MambaStateCopyFuncCalculator:
+ 
+     @classmethod
+     def gated_delta_net_state_copy_func(cls):
++        # VLLM_XPU_GDN_SNAPSHOT_COPY_V1
++        # XPU SYCL GDN writes conv[block_table[col + accepted_bias], :width-1]
++        # for every token, just as it checkpoints SSM. CUDA's rolling conv
++        # history slice within one block is a DIFFERENT storage contract.
++        import os
++        from vllm.platforms import current_platform
++        if (os.environ.get("VLLM_XPU_GDN_SNAPSHOT_COPY") == "1"
++                and current_platform.is_xpu()):
++            return (get_temporal_copy_spec, get_temporal_copy_spec)
+         return (get_conv_copy_spec, get_temporal_copy_spec)
+ 
+     @classmethod
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 67f06f4f5f..34032ed7ed 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -4,6 +4,7 @@
+ 
+ from collections.abc import Iterable
+ 
++import os
+ import torch
+ from torch import nn
+ 
+@@ -90,7 +91,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         # Ref: https://github.com/NVIDIA/Model-Optimizer/pull/1124
+         fc_quant = (
+             None
+-            if (quant_config and quant_config.get_name() == "modelopt_fp4")
++            # VLLM_XPU_MXFP4_BF16_MTP_FC: the explicit BF16 draft override
++            # must also cover the projection, not just decoder layers.
++            if ((quant_config and quant_config.get_name() == "modelopt_fp4")
++                or os.environ.get("VLLM_XPU_MTP_BF16_DRAFT") == "1")
+             else quant_config
+         )
+         self.fc = ColumnParallelLinear(
+@@ -109,10 +113,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         original_quant = vllm_config.quant_config
+         if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
+             hf_qc = getattr(model_config.hf_config, "quantization_config", None)
+-            if isinstance(hf_qc, dict):
++            if os.environ.get("VLLM_XPU_MTP_BF16_DRAFT") == "1":
++                print("[vllm-xpu] MTP draft: forcing unquantized build (env VLLM_XPU_MTP_BF16_DRAFT=1)")
++                vllm_config.quant_config = None
++            elif isinstance(hf_qc, dict):
+                 dynamic = hf_qc.get("dynamic", {})
+                 if any(k.startswith("-:") and "mtp" in k for k in dynamic):
+                     vllm_config.quant_config = None
++        # VLLM_XPU_MTP_NIGHTLY_DRAFT
+         self.layers = torch.nn.ModuleList(
+             Qwen3_5DecoderLayer(
+                 vllm_config,
+@@ -295,6 +303,16 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+         hidden_states: torch.Tensor,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor | None:
++        if os.environ.get("VLLM_XPU_DRAFT_LMHEAD_INT4") == "1":
++            from vllm.model_executor.models.vllm_xpu_draft_lmhead_int4 import (
++                build_draft_lmhead_int4,
++                draft_lmhead_int4_logits,
++            )
++
++            if getattr(self, "_vllm_xpu_lmhead_int4", None) is None:
++                build_draft_lmhead_int4(self)
++            if getattr(self, "_vllm_xpu_lmhead_int4", None) is not None:
++                return draft_lmhead_int4_logits(self, hidden_states)
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -310,7 +328,14 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+                 yield name, weight
+ 
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(remap_weight_names(weights))
++        result = loader.load_weights(remap_weight_names(weights))
++        if os.environ.get("VLLM_XPU_DRAFT_MTP_INT4") == "1":
++            from vllm.model_executor.models.vllm_xpu_draft_mtp_int4 import (
++                build_draft_mtp_int4,
++            )
++
++            build_draft_mtp_int4(self)
++        return result
+ 
+ 
+ class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
+diff --git a/vllm/platforms/xpu.py b/vllm/platforms/xpu.py
+index ddfde22522..af1c58a66d 100644
+--- a/vllm/platforms/xpu.py
++++ b/vllm/platforms/xpu.py
+@@ -111,6 +111,7 @@ class XPUPlatform(Platform):
+     dist_backend: str = "xccl"  # xccl only
+     device_control_env_var: str = "ZE_AFFINITY_MASK"
+     supported_quantization: list[str] = [
++        "quark",  # VLLM_XPU_MXFP4_QUARK: scheme validation remains enabled.
+         "awq",
+         "gptq",
+         "auto_awq",
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index e4a2132866..afe01a4986 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
++import json
++from adaptive_mtp import AdaptiveMTP
++if os.environ.get("VLLM_XPU_MTP_POLICY") == "throughput":
++    from adaptive_mtp_throughput import ThroughputAdaptiveMTP as AdaptiveMTP
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -246,6 +251,13 @@ class Scheduler(SchedulerInterface):
+         speculative_config = vllm_config.speculative_config
+         self.use_eagle = False
+         self.num_spec_tokens = vllm_config.num_speculative_tokens
++        # VLLM_XPU_ADAPTIVE_MTP_V1: state capacity remains eight draft tokens.
++        self._adaptive_mtp_enabled = os.environ.get("VLLM_XPU_ADAPTIVE_MTP") == "1"
++        self._adaptive_mtp_states = {}
++        if self._adaptive_mtp_enabled:
++            assert self.num_spec_tokens == 8
++            assert self.scheduler_config.max_num_seqs == 1
++            assert not self.scheduler_config.async_scheduling
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+         # Positions past the computed tokens that the drafter reads mid-prefill.
+         # Eagle-family drafters read 1 ahead, but multi-module MTP reads
+@@ -605,6 +617,28 @@ class Scheduler(SchedulerInterface):
+                 request, request.num_computed_tokens, num_new_tokens
+             )
+ 
++            # VLLM_XPU_MTP_PARTIAL_GROUP_GUARD_V3
++            # XPU GDN needs a complete speculative group to preserve one
++            # recurrent-state snapshot per candidate. If scheduler capacity
++            # truncates this request's group, schedule its target token instead.
++            if request.spec_token_ids:
++                num_scheduled_spec_tokens = (
++                    num_new_tokens
++                    + request.num_computed_tokens
++                    - request.num_tokens
++                    - request.num_output_placeholders
++                )
++                ordinary_target_tokens = (
++                    num_new_tokens - num_scheduled_spec_tokens
++                )
++                is_truncated_spec_group = (
++                    0 < num_scheduled_spec_tokens < (len(request.spec_token_ids) if self._adaptive_mtp_enabled else self.num_spec_tokens)
++                    and ordinary_target_tokens == 1
++                    and self.num_sampled_tokens_per_step == 1
++                )
++                if is_truncated_spec_group:
++                    num_new_tokens = ordinary_target_tokens
++
+             if num_new_tokens == 0:
+                 # The request cannot be scheduled because one of the following
+                 # reasons:
+@@ -1258,6 +1292,14 @@ class Scheduler(SchedulerInterface):
+                 len(num_scheduled_tokens)
+             ]
+ 
++        if self._adaptive_mtp_enabled:
++            self._adaptive_mtp_states = {k: v for k, v in self._adaptive_mtp_states.items()
++                                         if k in self.requests and not self.requests[k].is_finished()}
++            if len(num_scheduled_tokens) == 1:
++                rid = next(iter(num_scheduled_tokens))
++                state = self._adaptive_mtp_states.setdefault(rid, AdaptiveMTP())
++                num_spec_tokens_to_schedule = state.k
++
+         scheduled_encoder_input_stats = None
+         if (
+             self.log_stats
+@@ -1837,6 +1879,19 @@ class Scheduler(SchedulerInterface):
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                # Invalid padded proposals are not real draft rejections.
++                # Omit contaminated groups rather than biasing the controller.
++                if (self._adaptive_mtp_enabled and not output_is_stale
++                        and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id, 0)):
++                    state = self._adaptive_mtp_states.setdefault(req_id, AdaptiveMTP())
++                    observation = state.observe(num_draft_tokens, num_accepted)
++                    observation["request_id"] = req_id
++                    path = os.environ.get("ADAPTIVE_MTP_TELEMETRY")
++                    if path:
++                        with open(path, "a", encoding="utf-8") as evidence:
++                            evidence.write(json.dumps(observation) + "\n")
++                    if observation["next_k"] != observation["previous_k"]:
++                        logger.info("ADAPTIVE_MTP %s", json.dumps(observation))
+                 # Rejections roll back num_computed_tokens (and, under async
+                 # scheduling, num_output_placeholders, which covers the spec
+                 # tokens). A stale rejection count predates the preemption
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index ded6bc809a..cc99b948b8 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1279,6 +1279,7 @@ class MambaManager(SingleTypeKVCacheManager):
+         self.block_size = kv_cache_spec.block_size
+         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
++        self._replay_prefix_pins: dict[str, KVCacheBlock] = {}  # VLLM_XPU_MTP_REPLAY_PIN_V1
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+@@ -1668,6 +1669,7 @@ class MambaManager(SingleTypeKVCacheManager):
+                 return returned_blocks
+ 
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
++        self._release_replay_pin(request_id)
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+             self.last_state_block_idx.pop(request_id, None)
+@@ -1697,6 +1699,7 @@ class MambaManager(SingleTypeKVCacheManager):
+     ) -> None:
+         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
+         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
++        self._pin_replay_boundary(request, num_tokens)
+         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+         if self.mamba_cache_mode == "align":
+             partial_hash = self._cache_partial_tail_block(request, num_tokens)
+@@ -1714,6 +1717,34 @@ class MambaManager(SingleTypeKVCacheManager):
+                     continue
+                 self.cached_blocks_this_step.add(block.block_hash)
+ 
++    def _pin_replay_boundary(self, request: Request, num_tokens: int) -> None:
++        # MTP full-attention reuse drops one cache block. Retain the matching
++        # immutable recurrent-state snapshot, not an arbitrary later state.
++        # The normal request reference may be released while another prompt
++        # is being processed; this extra reference prevents premature LRU eviction.
++        request_id = request.request_id
++        if (self.mamba_cache_mode != "align" or self.num_speculative_blocks <= 0
++                or self.block_size != self.scheduler_block_size
++                or request_id in self._replay_prefix_pins):
++            return
++        boundary = ((request.num_prompt_tokens - 1) // self.block_size - 1) * self.block_size
++        if boundary <= 0 or num_tokens < boundary:
++            return
++        blocks = self.req_to_blocks.get(request_id, [])
++        index = boundary // self.block_size - 1
++        if index >= len(blocks):
++            return
++        block = blocks[index]
++        if block.is_null or block.block_hash is None:
++            return
++        self.block_pool.touch([block])
++        self._replay_prefix_pins[request_id] = block
++
++    def _release_replay_pin(self, request_id: str) -> None:
++        block = self._replay_prefix_pins.pop(request_id, None)
++        if block is not None:
++            self.block_pool.free_blocks([block])
++
+     def new_step_starts(self) -> None:
+         self.cached_blocks_this_step.clear()
+ 
+diff --git a/vllm/v1/cudagraph_dispatcher.py b/vllm/v1/cudagraph_dispatcher.py
+index 6a48b6282d..aa5efa5909 100644
+--- a/vllm/v1/cudagraph_dispatcher.py
++++ b/vllm/v1/cudagraph_dispatcher.py
+@@ -3,6 +3,7 @@
+ from collections.abc import Set as AbstractSet
+ from dataclasses import replace
+ from itertools import product
++import os
+ 
+ from vllm.config import CUDAGraphMode, VllmConfig
+ from vllm.forward_context import BatchDescriptor
+@@ -61,6 +62,7 @@ class CudagraphDispatcher:
+         )
+ 
+         self.keys_initialized = False
++        self._adaptive_c1_graphs = False
+         self.specialize_lora_count = (
+             self.vllm_config.lora_config.specialize_active_lora
+             if self.vllm_config.lora_config is not None
+@@ -140,7 +142,11 @@ class CudagraphDispatcher:
+         uniform_decode_query_len = self.uniform_decode_query_len
+         num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]
+ 
+-        if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
++        if self._adaptive_c1_graphs and uniform_decode:
++            assert 3 <= num_tokens <= 9, "Only complete C1 adaptive groups"
++            num_tokens_padded = num_tokens
++            num_reqs = 1
++        elif uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
+             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
+             assert num_tokens_padded % uniform_decode_query_len == 0
+         else:
+@@ -169,6 +175,21 @@ class CudagraphDispatcher:
+         # This should be called only after attention backend is initialized. So we can
+         # get the correct cudagraph mode after backend support is resolved.
+         self.cudagraph_mode = cudagraph_mode
++        # VLLM_XPU_ADAPTIVE_C1_GRAPHS_V1
++        self._adaptive_c1_graphs = (
++            os.environ.get("VLLM_XPU_ADAPTIVE_GRAPHS") == "1"
++            and uniform_decode_query_len == 9
++            and self.vllm_config.scheduler_config.max_num_seqs == 1
++            and cudagraph_mode.has_mode(CUDAGraphMode.FULL))
++        if self._adaptive_c1_graphs:
++            # Proposer and target share the upstream config object. Keep
++            # exact-group capture sizes local to this dispatcher.
++            from copy import copy
++            self.compilation_config = copy(self.compilation_config)
++            self.compilation_config.cudagraph_capture_sizes = sorted(
++                set(self.compilation_config.cudagraph_capture_sizes or []) | set(range(3, 10)))
++            self.compilation_config.max_cudagraph_capture_size = max(
++                self.compilation_config.cudagraph_capture_sizes)
+ 
+         # Early exit if cudagraphs are disabled
+         if cudagraph_mode == CUDAGraphMode.NONE:
+@@ -220,6 +241,8 @@ class CudagraphDispatcher:
+                 for x in self.compilation_config.cudagraph_capture_sizes
+                 if x <= max_num_tokens and x >= uniform_decode_query_len
+             ]
++            if self._adaptive_c1_graphs:
++                cudagraph_capture_sizes_for_decode = list(range(3, 10))
+             for bs, num_active_loras in product(
+                 cudagraph_capture_sizes_for_decode, lora_cases
+             ):
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e81913f928..8c44f70d1b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -3,6 +3,7 @@
+ 
+ import functools
+ import gc
++import os
+ import itertools
+ import threading
+ import time
+@@ -4383,6 +4384,19 @@ class GPUModelRunner(
+                 max_num_scheduled_tokens=max_num_scheduled_tokens,
+                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
++                # Never pad a prefill or truncated/no-draft step into a
++                # speculative graph. Only complete exact-length groups qualify.
++                force_eager=(os.environ.get("VLLM_XPU_ADAPTIVE_GRAPHS") == "1"
++                    and not (num_reqs == 1 and spec_decode_metadata is not None
++                        and len(scheduler_output.scheduled_spec_decode_tokens) == 1
++                        and 3 <= num_tokens_unpadded <= 9
++                        and sum(len(x) for x in scheduler_output.scheduled_spec_decode_tokens.values()) + 1 == num_tokens_unpadded)),
++                force_uniform_decode=(
++                    num_reqs == 1 and spec_decode_metadata is not None
++                    and len(scheduler_output.scheduled_spec_decode_tokens) == 1
++                    and 3 <= num_tokens_unpadded <= 9
++                    and sum(len(x) for x in scheduler_output.scheduled_spec_decode_tokens.values()) + 1 == num_tokens_unpadded
++                    if os.environ.get("VLLM_XPU_ADAPTIVE_GRAPHS") == "1" else None),
+                 allow_microbatching=self._allow_microbatching(
+                     num_reqs, num_scheduled_tokens_np
+                 ),
+@@ -4397,6 +4411,9 @@ class GPUModelRunner(
+                 num_tokens_across_dp,
+             )
+ 
++            if (os.environ.get("VLLM_XPU_ADAPTIVE_GRAPHS") == "1"
++                    and scheduler_output.scheduled_spec_decode_tokens):
++                logger.info_once("ADAPTIVE_GRAPH_REPLAY tokens=%d mode=%s", num_tokens_unpadded, cudagraph_mode)
+             num_tokens_padded = batch_desc.num_tokens
+             num_reqs_padded = (
+                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
+@@ -5989,6 +6006,11 @@ class GPUModelRunner(
+         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
+         # for GQA/MQA.
+         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
++        if (os.environ.get("VLLM_XPU_ADAPTIVE_GRAPHS") == "1"
++                and uniform_decode and self.num_spec_tokens == 8
++                and self.scheduler_config.max_num_seqs == 1):
++            assert 3 <= num_tokens <= 9
++            max_query_len = num_tokens
+ 
+         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
+         # for dummy run with LoRA so that the num_reqs collectively
