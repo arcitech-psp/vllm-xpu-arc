@@ -79,7 +79,7 @@ with runs from 214 to 219, so the old 219 is within that run-to-run range.
 The fixed route's minimum was 215/224. It passed cold/warm identity and a 20-minute,
 four-chat soak with zero preemptions.
 
-<img src="assets/card-throughput.png" alt="Median-of-three speed comparison for one stream, four streams, and six cookbook cells">
+<img src="assets/card-throughput.png" alt="Speed against the first release: 148 vs 116.9 tokens/s for one user, 380 vs 339.9 across four users">
 
 ### Compared with our first release
 
@@ -95,6 +95,19 @@ Same card, same weights, same four 131K slots. For a strictly fair read: re-meas
 night with this update's harness, the first-release build gives 132.7 tok/s (one user) and
 373.1 (four users), so part of the jump is the more careful measurement and part is the new
 serving route. Both comparisons are below.
+
+### Speed as the context grows
+<img src="assets/card-context.png" alt="Generation speed from a 512-token to a full 128K-token prompt: 118.6 tokens/s at 128K with 512 tokens out, versus the cookbook's 94.0">
+
+| Prompt | 512 out | 128 out | Cookbook (512 / 128 out) |
+|---|---:|---:|---:|
+| 512 | 139.9 | 124.0 | 148.35 / 170.91 |
+| 8K | **173.3** | 130.4 | 138.03 / 164.36 |
+| 32K | 144.6 | 108.7 | — |
+| 64K | 141.6 | 122.8 | — |
+| Full 128K | **118.6** | **114.3** | 94.01 / 101.64 |
+
+Tokens/s after the first token, median of three isolated requests on an idle server, same production build. A full 131K-token prompt takes about 63 s before the first token; after the 128K runs the server still reported 4.01x concurrency at 131K and 0 preemptions. Short replies are where this build trails the cookbook; long prompts are where it leads.
 
 The speed comparison is the median of three blocks from the same `tfinal_bench.sh` measurement,
 run back-to-back with the baseline. `tfast_bench.py` uses deterministic temperature-zero cells.
