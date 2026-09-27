@@ -15,9 +15,9 @@ route, not a certification for every model, driver, or future vLLM release.
 ## At a glance
 
 - **One Intel Arc Pro B70, 32 GB** served the tested 35B-parameter coding model.
-- **116.9 tokens/s for one user; 339.9 tokens/s shared across four** on GPTQ-A.
-- **219 of 224** on the internal agentic coding evaluation.
-- **Four 131,072-token conversations at once** in the measured configuration.
+- **144.4 tokens/s for one stream; 380.4 tokens/s across four** on the fixed-K3 route.
+- **217.7 of 224** as the mean of ten quality runs; the same-night baseline mean was 217.2.
+- **526,012 KV tokens (4.01× 131,072)** in the measured configuration.
 - **vLLM 0.27.2rc1.dev77+gac7509e2b**, a custom XPU build with PyTorch XPU support.
 
 Tokens per second (tokens/s) is how quickly generated text arrives. A shared
@@ -51,7 +51,7 @@ Everything below was read from the machine itself.
 |---|---|
 | Model weights | **22.0 GB** (20.5 GiB) in 42 files, including the 1.7 GB draft (MTP) head |
 | GPU memory reserved by vLLM | 97% of 30.3 GiB, about **29.4 GiB** (weights + KV cache + runtime) |
-| KV cache | **546,708 tokens** in FP8 — room for 4.17 full 131,072-token conversations |
+| KV cache | **526,012 tokens** in FP8 — room for 4.01 full 131,072-token conversations |
 | Host memory in use | about 7.5 GB of 32 GB (spot reading with the vLLM server running) |
 
 ### Software
@@ -65,32 +65,49 @@ Everything below was read from the machine itself.
 
 ## Measured results
 
-<img src="assets/card-quality-speed.png" alt="Points missed and seconds per task on the same 100-task agentic coding eval: Tiel-Coder XPU 5 missed in 0.36 s, community GGUF on vLLM 7 and 8 missed in 1.27 s and 1.23 s, AutoRound int4 9 to 11 missed in 0.34 to 0.35 s">
+<img src="assets/card-quality-speed.png" alt="Ten-run quality means for the fixed Tiel-Coder XPU route and its same-night baseline, including category means and minimum score">
 
-Every build below carries the same Ornith-1.5 weights and Sharp template and ran through the same runner,
-the same 100 tasks and the same Arc Pro B70.
+The original published single-run result of **219/224** remains useful historical context. The controlled
+10-run comparison below uses the same runner and same-night baseline: the baseline mean was 217.2,
+with runs from 214 to 219, so the old 219 is within that run-to-run range.
 
-| Build | Points (of 224) | Missed | Seconds per task |
-|---|---:|---:|---:|
-| **Tiel-Coder XPU (ours) — GPTQ-A int4 + MTP** | **219** | **5** | **0.36** |
-| Community Tiel GGUF on vLLM — BF16 dense | 217 | 7 | 1.27 |
-| Community Tiel GGUF on vLLM — FP8 dense | 216 | 8 | 1.23 |
-| Community AutoRound int4 + MTP (two runs) | 213–215 | 9–11 | 0.34–0.35 |
+| Build | 10-run mean | Run range | Code mean | Tool mean | Edit mean |
+|---|---:|---:|---:|---:|---:|
+| **Tiel-Coder XPU fixed-K3 + draft INT4** | **217.7** | **215–221** | **180.3** | **17.7** | **19.7** |
+| Same-night published-build baseline | 217.2 | 214–219 | 180.2 | 17.1 | 19.9 |
 
-Our build scores highest (code 181/184, tool 18/20, edit 20/20) and finishes each task 3.4× faster than the
-GGUF route. The aggregate summaries are in the [data repository](https://github.com/arcitech-psp/tiel-coder-xpu/tree/main/bench/eval).
+The fixed route's minimum was 215/224. It passed cold/warm identity and a 20-minute,
+four-chat soak with zero preemptions.
 
-<img src="assets/card-throughput.png" alt="Decode speed per user and in total at one, two and four users: 116.9 tokens/s for one user, 339.9 tokens/s total for four">
+<img src="assets/card-throughput.png" alt="Median-of-three speed comparison for one stream, four streams, and six cookbook cells">
 
-| Users at once | Per user (tokens/s) | Total (tokens/s) |
-|---|---:|---:|
-| 1 | 116.9 | 113.4 |
-| 2 | 105.9–113.6 | 195.6 |
-| 4 | 92.5–94.0 | 339.9 |
+The speed comparison is the median of three blocks from the same `tfinal_bench.sh` measurement,
+run back-to-back with the baseline. `tfast_bench.py` uses deterministic temperature-zero cells.
+
+| Cell | Baseline | Fixed build | Change | Cookbook reference |
+|---|---:|---:|---:|---:|
+| bench, 1 stream | 132.7 | **144.4** | **+8.8%** | — |
+| bench, 4 streams | 373.1 | **380.4** | **+2.0%** | — |
+| 512 × 32 | 103.7 | **114.6** | **+10.5%** | 178.34 |
+| 512 × 128 | 112.5 | **123.1** | **+9.4%** | 170.91 |
+| 512 × 512 | 119.6 | **133.7** | **+11.8%** | 148.35 |
+| 8192 × 32 | 107.6 | **109.4** | **+1.7%** | 156.28 |
+| 8192 × 128 | 143.7 | **156.0** | **+8.6%** | 164.36 |
+| 8192 × 512 | 166.9 | **174.3** | **+4.4%** | 138.03 |
+
+All six cells beat the same-wrapper baseline. The long 8192 × 512 cell is ahead of the
+[public B70 cookbook](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook)'s
+138.03 reference, while the short cells still trail its 178.34, 170.91, and 148.35 numbers.
+That is not a like-for-like setup: the cookbook reference is one user with 16-bit KV and a
+larger batch, while this route keeps four 131K conversations with FP8 KV.
 
 <img src="assets/card-inside.png" alt="93.5 percent of the weights are routed experts in GPTQ int4; 6.5 percent stay in BF16">
 
-<img src="assets/card-mtp.png" alt="Multi-token prediction acceptance by draft position: 74.3, 50.9 and 35.6 percent">
+<img src="assets/card-mtp.png" alt="BF16 MTP head acceptance by draft position: 88.2, 72.4, and 54.8 percent for the three configured drafts">
+
+The BF16-head acceptance screen measured 88.2%, 72.4%, 54.8%, and 41.8% at positions 0–3.
+The fixed-K3 serving recipe uses the first three positions; the fourth value is retained from
+the K4 acceptance screen for completeness.
 
 ## How to read this
 
@@ -121,6 +138,16 @@ git -C vllm checkout ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9
 ./scripts/apply-vllm-core-patch.sh vllm
 docker build -t vllm-xpu-arc:local .
 ```
+
+For the fixed fast route, use [`scripts/serve-fast.sh`](scripts/serve-fast.sh). Set
+`MODEL_DIR` to the model directory and provide any required runtime overlay paths through
+its variables; the script keeps `B70_MTP_BF16_DRAFT=1`, `B70_DRAFT_LMHEAD_INT4=1`,
+`B70_DRAFT_MTP_INT4=1`, fixed K3, FP8 KV, four slots, and the startup prewarm together.
+The helper sources are [`patches/vllm_xpu_draft_lmhead_int4.py`](patches/vllm_xpu_draft_lmhead_int4.py),
+[`patches/vllm_xpu_draft_mtp_int4.py`](patches/vllm_xpu_draft_mtp_int4.py),
+[`scripts/tiel-mtp4-entrypoint.sh`](scripts/tiel-mtp4-entrypoint.sh),
+[`scripts/prewarm_shortreply.py`](scripts/prewarm_shortreply.py), and
+[`bench/tfinal_bench.sh`](bench/tfinal_bench.sh).
 
 Use the model's Tiel Sharp template, BF16 compute, FP8 KV cache, four 131K
 slots, three MTP drafts, and the parser settings shown in the model card.
@@ -173,7 +200,8 @@ benchmark.
 - `plugins/vllm-gguf-plugin/` — plugin source and tests.
 - `adaptive/` — optional adaptive MTP and Gated DeltaNet SYCL sources.
 - `mxfp4/` — optional oneDNN-backed MXFP4 W4A16 sources.
-- `scripts/` — patch and container-run helpers.
+- `scripts/` — patch, fixed-K3 serving, prewarm, and container-run helpers.
+- `bench/tfinal_bench.sh` and `bench/tfast_bench.py` — the repeatable median-of-three speed measurement.
 
 ## Limits and privacy
 
@@ -191,11 +219,9 @@ Tiel and the Sharp template, biMEMO's earlier reference work, and the Hugging
 Face community. The related model is published at the
 [Hugging Face account `arcitech-psp`](https://huggingface.co/arcitech-psp).
 
-## Feedback and contact
+## Feedback
 
-Feedback form: [Google Form](https://docs.google.com/forms/d/1gaUBeulGlZwo8gt4eucGpg3biCKy-tli79urdTesXSI/viewform).
-Direct contact: [parthpatel266@gmail.com](mailto:parthpatel266@gmail.com).
-GitHub account: [arcitech-psp](https://github.com/arcitech-psp).
+Please use the public [GitHub account](https://github.com/arcitech-psp) for feedback.
 
 ## License and related pages
 
