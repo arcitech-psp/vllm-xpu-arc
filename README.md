@@ -65,7 +65,7 @@ Everything below was read from the machine itself.
 
 ## Measured results
 
-<img src="assets/card-quality-speed.png" alt="Ten-run quality means for the fixed Tiel-Coder XPU route and its same-night baseline, including category means and minimum score">
+<img src="assets/card-quality-speed.png" alt="Quality: 217.7 of 224 averaged over ten runs, best 221; the first release scored 219 in a single run">
 
 The original published single-run result of **219/224** remains useful historical context. The controlled
 10-run comparison below uses the same runner and same-night baseline: the baseline mean was 217.2,
