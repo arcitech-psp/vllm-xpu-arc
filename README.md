@@ -272,4 +272,3 @@ this repository follows Apache-2.0 as documented in `LICENSE` and `NOTICE`.
 
 - [Tiel-Coder data repository](https://github.com/arcitech-psp/tiel-coder-xpu)
 - [Tiel-Coder model card](https://huggingface.co/arcitech-psp/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP)
-- [How Tiel-Coder XPU was built](../docs/APPROACH.md)
