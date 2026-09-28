@@ -12,6 +12,8 @@ route measured with Tiel-Coder: compressed-tensors W4A16 expert weights, the
 official BF16 MTP head, and three speculative draft tokens. It is a measured
 route, not a certification for every model, driver, or future vLLM release.
 
+**Model source:** [peculiar-ragdoll's Tiel-Coder-35B-A3B](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP), which is [Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) with the [Sharp chat template](https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates).
+
 ## At a glance
 
 - **One Intel Arc Pro B70, 32 GB** served the tested 35B-parameter coding model.
@@ -177,7 +179,7 @@ The helper sources are [`patches/vllm_xpu_draft_lmhead_int4.py`](patches/vllm_xp
 [`scripts/prewarm_shortreply.py`](scripts/prewarm_shortreply.py), and
 [`bench/tfinal_bench.sh`](bench/tfinal_bench.sh).
 
-Use the model's Tiel Sharp template, BF16 compute, FP8 KV cache, four 131K
+Use the model's Tiel [Sharp template](https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates), BF16 compute, FP8 KV cache, four 131K
 slots, three MTP drafts, and the parser settings shown in the model card.
 Re-measure capacity for a different model, driver, or slot count.
 
@@ -241,10 +243,22 @@ benchmark.
 
 ## Credits
 
-This work stands on the vLLM project and its Intel XPU contributors, Intel's
-Arc hardware and XPU software stack, the Ornith team, `peculiar-ragdoll` for
-Tiel and the Sharp template, biMEMO's earlier reference work, and the Hugging
-Face community. The related model is published at the
+This work stands on:
+
+- [`peculiar-ragdoll`](https://huggingface.co/peculiar-ragdoll) — [Tiel-Coder-35B-A3B](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP)
+  (the source this release is named after; also published as [GGUF](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF))
+  and the [Sharp chat template](https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates) shipped with the model as `chat_template.jinja`.
+- [Ornith team (`ornith-ai`)](https://huggingface.co/ornith-ai) — [Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B),
+  the upstream model of Tiel-Coder, its official BF16 weights and MTP head, and MIT licensing.
+- [biMEMO](https://huggingface.co/biMEMO) — [Ornith-1.5-35B-A3B-int4-AutoRound-MTP](https://huggingface.co/biMEMO/Ornith-1.5-35B-A3B-int4-AutoRound-MTP),
+  earlier int4/MTP reference work and the AutoRound int4 + MTP build compared on the model card.
+- [Community Tiel GGUF](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF) by `peculiar-ragdoll` — the GGUF build compared on the model card.
+- [Intel Arc Pro B70 inference cookbook](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook) by SergiioB — the public speed reference.
+- [vLLM project](https://github.com/vllm-project/vllm) and Intel XPU contributors ([vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels)) — serving foundation and XPU work.
+- Intel — Arc hardware and XPU software stack ([compute-runtime](https://github.com/intel/compute-runtime)).
+- [Hugging Face](https://huggingface.co) community — models, tools, and practical feedback.
+
+The related model is published at the
 [Hugging Face account `arcitech-psp`](https://huggingface.co/arcitech-psp).
 
 ## Feedback
