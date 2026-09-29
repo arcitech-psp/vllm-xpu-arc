@@ -183,6 +183,81 @@ Use the model's Tiel [Sharp template](https://huggingface.co/peculiar-ragdoll/Qw
 slots, three MTP drafts, and the parser settings shown in the model card.
 Re-measure capacity for a different model, driver, or slot count.
 
+## Decision models on Arc: Mintelica
+
+`decision/` serves [sky7350's Mica-v0.1-4B](https://huggingface.co/sky7350/Mica-v0.1-4B), a small decision model
+built on [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), on Intel Arc. Mica ships for CUDA; we call the Intel
+builds **Mintelica** (Mica for Intel).
+Mica reads a state and a question once and returns a probability for each allowed answer (yes/no, a choice, or a
+score). It generates no text, so one decision costs one prefill.
+
+`s1_systemone.py` puts the TypeSafe `/v1/systemone` API in front of vLLM XPU. Request parsing, the prompt and the
+answer shapes are Mica's own code, so JevBench's `typesafe` adapter works unchanged. Each request is one prefill with
+`max_tokens 1`. vLLM returns the raw logits of the option label tokens only (`allowed_token_ids` with
+`--logprobs-mode processed_logits`). The front end divides them by sky7350's fitted temperature (1.1245) and applies
+a softmax.
+
+| Build (Hugging Face) | Weights loaded | JevBench easy / original / hard, B580 | same, B70 | p50 original, B580 / B70 |
+|---|---:|---|---|---:|
+| [Mintelica-v0.1-4B-BF16](https://huggingface.co/arcitech-psp/Mintelica-v0.1-4B-BF16) (sky7350's weights) | 7.87 GiB | 100 / 100 / 63.7 | 100 / 100 / 63.4 | 78 / 72 ms |
+| [Mintelica-v0.1-4B-FP8](https://huggingface.co/arcitech-psp/Mintelica-v0.1-4B-FP8), BF16 math (W8A16) **recommended** | 4.55 GiB | 100 / 100 / 67.9 | 100 / 100 / 65.5 | 68 / 66 ms |
+| same FP8 files, FP8 math (W8A8) | 4.55 GiB | 100 / 100 / 64.0 | 100 / 100 / 63.1 | 88 / 78 ms |
+| [Mintelica-v0.1-4B-INT8](https://huggingface.co/arcitech-psp/Mintelica-v0.1-4B-INT8), our XPU INT8 kernel | 4.55 GiB | 100 / 100 / 65.2 | 100 / 100 / 62.5 * | 84 ms / not measured |
+| CUDA reference: Mica's own server, RTX 4080 Laptop | BF16 GGUF | 100 / 100 / 64.0 | | 75 ms |
+
+Each Arc build was run three times per card (mean shown), with one request at a time from a separate machine.
+The model cards list the full test systems, the min–max ranges and the p50 per tier.
+The hard tier has 111 items, so one item is 0.9 points. We read the FP8 build's 65.5–67.9 as "no loss", not as a gain.
+FP8 math (W8A8) was not faster than FP8 weights with BF16 math on either Battlemage card.
+
+INT8 runs on our fused XPU INT8 kernel ([`decision/int8-kernel`](decision/int8-kernel)), which `serve-decision.sh`
+mounts automatically for INT8 checkpoints. vLLM's generic Triton INT8 was ~3.5–6× slower; we added a kernel. On the
+B580, one request takes 52 / 181 / 600 ms at short / ~1K / ~4K tokens, against FP8's 50 / 188 / 679 ms (median of 20).
+\* INT8 on the B70 was run only on the Triton path. The kernel's outputs are bit-identical to it, so the accuracy
+carries over; the B70 latency was not re-measured.
+
+Stability, with the same ~4K-token request sent 20 times on the B580: BF16 and FP8 gave the same answer 20/20 times.
+INT8 gave it 18/20 times, because that request sits near a tie between two options.
+
+### Serving
+
+```bash
+git clone https://github.com/akivet/Mica-v0.1-4B          # Mica's prompt, codebook and wire format
+docker build -t vllm-xpu-arc:local .                        # this repository's image (see "Best working path")
+MODEL_DIR=/path/to/Mintelica-v0.1-4B-FP8 MICA_SRC=$PWD/Mica-v0.1-4B ./decision/serve-b580.sh   # or serve-b70.sh
+curl -s localhost:8012/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "The user asked to delete the staging database. No approval has been given.",
+  "questions": {"q": {"type": "noul", "instructions": "Should the agent delete it now?"}}}'
+```
+
+`serve-decision.sh` holds the settings we tested. The presets only change the card index, the memory share and the
+number of sequences. BF16 on the 12 GB B580 needs a larger `UTIL` than the preset's 0.55, since its weights alone
+are 7.87 GiB. Set `W8A8=1` to serve the FP8 files with FP8 math (`--linear-backend xpu`).
+
+### Fixes these scripts carry
+
+- **`SYCL_CACHE_PERSISTENT=0`.** With the image default (`1`), the persistent SYCL device-code cache segfaulted on
+  the first request. Turning it off costs some warm-up on each start and avoids the crash.
+- **Device flags.** `--device /dev/dri --privileged --group-add <render group>` pass the Arc card in, and
+  `ZE_AFFINITY_MASK=<index>` pins the model to one card. The script reads the render group's GID from
+  `/dev/dri/renderD*` and falls back to `render`. The tested runs used `--privileged`; we have not validated a
+  non-privileged run for this model. On the B70 we also set `ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE`.
+- **`adaptive_mtp` on the path.** The patched scheduler imports `adaptive_mtp` at startup, even when adaptive MTP
+  is off. The image puts `/opt/vllm-xpu-arc/adaptive` on `PYTHONPATH`, but passing your own `-e PYTHONPATH=...`
+  replaces that entry and vLLM fails to start. The script mounts `adaptive/adaptive_mtp.py` and keeps both paths.
+- **Eager mode.** `--enforce-eager`, with XPU graphs off. For these one-prefill requests, XPU graphs gave no prefill gain.
+
+### Building and measuring
+
+- `quantize_fp8.py` and `quantize_int8.py` run at the tensor level, with no model load and no calibration data.
+  They use per-output-channel symmetric scales and write compressed-tensors output. The Mintelica builds use
+  `SCOPE=all`: MLP, full attention and Gated DeltaNet projections. Embeddings, norms, conv1d and the small gate
+  projections stay BF16.
+- `bench/run_jev.sh` runs [JevBench](https://github.com/fstandhartinger/jevbench) public easy, original and hard
+  through the unchanged `typesafe` adapter. `bench/repeat_jev.sh` repeats it N times and writes the mean, min
+  and max. `bench/load_test.py` replays the recorded JevBench requests with 1, 4, 8 and 16 concurrent clients.
+- Copy `calibration.json` (sky7350's temperature) into any model folder you build yourself.
+
 ## For practitioners
 
 ### Feature matrix
@@ -232,6 +307,7 @@ benchmark.
 - `mxfp4/` — optional oneDNN-backed MXFP4 W4A16 sources.
 - `scripts/` — patch, fixed-K3 serving, prewarm, and container-run helpers.
 - `bench/tfinal_bench.sh` and `bench/tfast_bench.py` — the repeatable median-of-three speed measurement.
+- `decision/` — Mintelica: the TypeSafe `/v1/systemone` front end, serve scripts, FP8/INT8 quantizers and JevBench/load scripts.
 
 ## Limits and privacy
 
@@ -254,6 +330,10 @@ This work stands on:
   earlier int4/MTP reference work and the AutoRound int4 + MTP build compared on the model card.
 - [Community Tiel GGUF](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF) by `peculiar-ragdoll` — the GGUF build compared on the model card.
 - [Intel Arc Pro B70 inference cookbook](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook) by SergiioB — the public speed reference.
+- [sky7350](https://huggingface.co/sky7350) — [Mica-v0.1-4B](https://huggingface.co/sky7350/Mica-v0.1-4B) (code: [akivet/Mica-v0.1-4B](https://github.com/akivet/Mica-v0.1-4B)): the decision model, its prompt, label codebook and calibration, served by `decision/`.
+- [Qwen team](https://huggingface.co/Qwen) — [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), the base model under Mica.
+- [JevBench](https://github.com/fstandhartinger/jevbench) by fstandhartinger — the decision benchmark and its `typesafe` adapter.
+- [TypeSafe AI](https://typesafe.ai/blog/introducing-system-one-models-and-jev) — Jev and the `/v1/systemone` format.
 - [vLLM project](https://github.com/vllm-project/vllm) and Intel XPU contributors ([vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels)) — serving foundation and XPU work.
 - Intel — Arc hardware and XPU software stack ([compute-runtime](https://github.com/intel/compute-runtime)).
 - [Hugging Face](https://huggingface.co) community — models, tools, and practical feedback.
