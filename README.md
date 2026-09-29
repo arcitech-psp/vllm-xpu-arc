@@ -186,7 +186,8 @@ Re-measure capacity for a different model, driver, or slot count.
 ## Decision models on Arc: Mintelica
 
 `decision/` serves [sky7350's Mica-v0.1-4B](https://huggingface.co/sky7350/Mica-v0.1-4B), a small decision model
-built on [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), on Intel Arc. We call the Arc builds **Mintelica**.
+built on [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), on Intel Arc. Mica ships for CUDA; we call the Intel
+builds **Mintelica** (Mica for Intel).
 Mica reads a state and a question once and returns a probability for each allowed answer (yes/no, a choice, or a
 score). It generates no text, so one decision costs one prefill.
 
@@ -198,24 +199,32 @@ a softmax.
 
 | Build (Hugging Face) | Weights loaded | JevBench easy / original / hard, B580 | same, B70 | p50 original, B580 / B70 |
 |---|---:|---|---|---:|
-| [BF16](https://huggingface.co/arcitech-psp/Mica-v0.1-4B-BF16-XPU) (sky7350's weights) | 7.87 GiB | 100 / 100 / 63.7 | 100 / 100 / 63.4 | 78 / 72 ms |
-| [FP8, BF16 math (W8A16)](https://huggingface.co/arcitech-psp/Mica-v0.1-4B-FP8-XPU) **recommended** | 4.55 GiB | 100 / 100 / 67.9 | 100 / 100 / 65.5 | 68 / 66 ms |
+| [Mintelica-v0.1-4B-BF16](https://huggingface.co/arcitech-psp/Mintelica-v0.1-4B-BF16) (sky7350's weights) | 7.87 GiB | 100 / 100 / 63.7 | 100 / 100 / 63.4 | 78 / 72 ms |
+| [Mintelica-v0.1-4B-FP8](https://huggingface.co/arcitech-psp/Mintelica-v0.1-4B-FP8), BF16 math (W8A16) **recommended** | 4.55 GiB | 100 / 100 / 67.9 | 100 / 100 / 65.5 | 68 / 66 ms |
 | same FP8 files, FP8 math (W8A8) | 4.55 GiB | 100 / 100 / 64.0 | 100 / 100 / 63.1 | 88 / 78 ms |
-| [INT8 (W8A8)](https://huggingface.co/arcitech-psp/Mica-v0.1-4B-INT8-XPU) | 4.55 GiB | 100 / 100 / 64.6 | 100 / 100 / 62.5 | 232 / 192 ms |
+| [Mintelica-v0.1-4B-INT8](https://huggingface.co/arcitech-psp/Mintelica-v0.1-4B-INT8), our XPU INT8 kernel | 4.55 GiB | 100 / 100 / 65.2 | 100 / 100 / 62.5 * | 84 ms / not measured |
 | CUDA reference: Mica's own server, RTX 4080 Laptop | BF16 GGUF | 100 / 100 / 64.0 | | 75 ms |
 
 Each Arc build was run three times per card (mean shown), with one request at a time from a separate machine.
 The model cards list the full test systems, the min–max ranges and the p50 per tier.
 The hard tier has 111 items, so one item is 0.9 points. We read the FP8 build's 65.5–67.9 as "no loss", not as a gain.
-FP8 math (W8A8) was not faster than FP8 weights with BF16 math on either Battlemage card. INT8 is accurate, but the
-current vLLM Triton INT8 path is launch-bound. An XPU INT8 kernel is being tested (result pending).
+FP8 math (W8A8) was not faster than FP8 weights with BF16 math on either Battlemage card.
+
+INT8 runs on our fused XPU INT8 kernel ([`decision/int8-kernel`](decision/int8-kernel)), which `serve-decision.sh`
+mounts automatically for INT8 checkpoints. vLLM's generic Triton INT8 was ~3.5–6× slower; we added a kernel. On the
+B580, one request takes 52 / 181 / 600 ms at short / ~1K / ~4K tokens, against FP8's 50 / 188 / 679 ms (median of 20).
+\* INT8 on the B70 was run only on the Triton path. The kernel's outputs are bit-identical to it, so the accuracy
+carries over; the B70 latency was not re-measured.
+
+Stability, with the same ~4K-token request sent 20 times on the B580: BF16 and FP8 gave the same answer 20/20 times.
+INT8 gave it 18/20 times, because that request sits near a tie between two options.
 
 ### Serving
 
 ```bash
 git clone https://github.com/akivet/Mica-v0.1-4B          # Mica's prompt, codebook and wire format
 docker build -t vllm-xpu-arc:local .                        # this repository's image (see "Best working path")
-MODEL_DIR=/path/to/Mica-v0.1-4B-FP8-XPU MICA_SRC=$PWD/Mica-v0.1-4B ./decision/serve-b580.sh   # or serve-b70.sh
+MODEL_DIR=/path/to/Mintelica-v0.1-4B-FP8 MICA_SRC=$PWD/Mica-v0.1-4B ./decision/serve-b580.sh   # or serve-b70.sh
 curl -s localhost:8012/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "The user asked to delete the staging database. No approval has been given.",
   "questions": {"q": {"type": "noul", "instructions": "Should the agent delete it now?"}}}'

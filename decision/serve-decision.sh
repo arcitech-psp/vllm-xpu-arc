@@ -3,7 +3,7 @@
 # TypeSafe /v1/systemone front end (s1_systemone.py). vLLM listens inside the container on 127.0.0.1:8020;
 # the front end is published on the host at http://localhost:$PORT/v1/systemone.
 #
-#   MODEL_DIR=/path/to/Mica-v0.1-4B-FP8-XPU MICA_SRC=/path/to/Mica-v0.1-4B ./decision/serve-decision.sh
+#   MODEL_DIR=/path/to/Mintelica-v0.1-4B-FP8 MICA_SRC=/path/to/Mica-v0.1-4B ./decision/serve-decision.sh
 #
 # Tested presets: serve-b580.sh (12 GB Arc B580) and serve-b70.sh (32 GB Arc Pro B70).
 set -euo pipefail
