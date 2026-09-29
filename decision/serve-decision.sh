@@ -51,7 +51,7 @@ docker run -d --name "$NAME" -p "$PORT:8012" \
   -e VLLM_XPU_ADAPTIVE_MTP=0 -e VLLM_XPU_ADAPTIVE_GRAPHS=0 -e VLLM_XPU_MTP_POLICY=none -e ADAPTIVE_MTP_TELEMETRY=/dev/null \
   -e PYTHONPATH=/work/adaptive_mtp:/opt/vllm-xpu-arc/adaptive:/opt/vllm-xpu-arc/mxfp4 -e MICA_SRC=/mica \
   -v "$MODEL_DIR:/model:ro" -v "$MICA_SRC:/mica:ro" -v "$HERE:/decision:ro" \
-  -v "$REPO/adaptive/adaptive_mtp.py:/work/adaptive_mtp/adaptive_mtp.py:ro" \
+  -v "$REPO/adaptive/adaptive_mtp.py:/work/adaptive_mtp/adaptive_mtp.py:ro" ${int8[@]+"${int8[@]}"} \
   --entrypoint bash "$IMAGE" -c "
   vllm serve /model --served-model-name $NAME --port 8020 --host 127.0.0.1 --dtype bfloat16 \
     --max-model-len 8192 --max-num-seqs $MAX_NUM_SEQS --gpu-memory-utilization $UTIL --enable-prefix-caching \
