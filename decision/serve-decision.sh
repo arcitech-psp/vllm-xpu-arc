@@ -21,11 +21,17 @@ MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 MAX_TOKENS=${MAX_TOKENS:-8000}     # longer inputs are refused with HTTP 400, never truncated
 W8A8=${W8A8:-0}                    # FP8 build only: 1 = FP8 math (XPUW8A8FP8LinearKernel); 0 = FP8 weights, BF16 math
 EXTRA=${EXTRA:-}
+INT8_KERNEL=${INT8_KERNEL:-auto}       # auto = on for INT8 (int-quantized) checkpoints: our fused XPU INT8 W8A8 kernel
 RENDER_GROUP=${RENDER_GROUP:-$(stat -c '%g' /dev/dri/renderD* 2>/dev/null | head -1 || true)}
 RENDER_GROUP=${RENDER_GROUP:-render}
 if [ "$W8A8" = 1 ]; then EXTRA="--linear-backend xpu $EXTRA"; fi
 [ -f "$MODEL_DIR/calibration.json" ] || { echo "missing $MODEL_DIR/calibration.json" >&2; exit 1; }
 
+int8=()
+if [ "$INT8_KERNEL" = 1 ] || { [ "$INT8_KERNEL" = auto ] && grep -q '"int-quantized"' "$MODEL_DIR/config.json"; }; then
+  VL=/opt/venv/lib/python3.12/site-packages/vllm/model_executor/kernels/linear
+  int8=(-v "$HERE/int8-kernel/xpu_int8.py:$VL/scaled_mm/xpu_int8.py:ro" -v "$HERE/int8-kernel/linear_init_patched.py:$VL/__init__.py:ro")
+fi
 hier=()
 if [ -n "${ZE_FLAT_DEVICE_HIERARCHY:-}" ]; then hier=(-e "ZE_FLAT_DEVICE_HIERARCHY=$ZE_FLAT_DEVICE_HIERARCHY"); fi
 
@@ -34,6 +40,8 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 #  * --device /dev/dri --privileged --group-add <render gid>: the tested device setup.
 #  * ZE_AFFINITY_MASK: pin the model to one Arc card.
 #  * SYCL_CACHE_PERSISTENT=0: the persistent SYCL device-code cache segfaulted on the first request.
+#  * INT8 checkpoints: vLLM's generic Triton INT8 path is launch-bound on Arc (~3.5-6x slower); int8-kernel/ mounts
+#    our fused XPU INT8 W8A8 kernel (2 launches per linear, int8 DPAS GEMM with the dequant fused), bit-identical outputs.
 #  * The patched scheduler imports adaptive_mtp at startup even with adaptive MTP off. Setting PYTHONPATH
 #    replaces the image's own entry, so the module is mounted and kept on the path explicitly.
 docker run -d --name "$NAME" -p "$PORT:8012" \
