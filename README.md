@@ -4,7 +4,7 @@
 [![Intel Arc XPU](https://img.shields.io/badge/target-Intel%20Arc%20XPU-0071C5.svg)](https://www.intel.com/content/www/us/en/products/details/discrete-gpus/arc/workstations/a-series.html)
 [![Tiel-Coder model](https://img.shields.io/badge/Tiel--Coder-Hugging%20Face-orange.svg)](https://huggingface.co/arcitech-psp/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP)
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="assets/arcitech-logo-white.png"><img src="assets/arcitech-logo-black.png" alt="ArciTech logo"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/at-logo-white.png"><img src="assets/at-logo-black.png" alt="ArciTech" width="120"></picture>
 <img src="assets/hero-dark.png" alt="vLLM XPU for Intel Arc">
 
 This is a reviewable local build recipe for the best working Intel Arc/XPU
