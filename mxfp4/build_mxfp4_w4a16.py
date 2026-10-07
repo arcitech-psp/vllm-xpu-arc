@@ -2,7 +2,7 @@
 import argparse,os,pathlib
 p=argparse.ArgumentParser();p.add_argument('--onednn',choices=['installed','3132'],default='installed');args=p.parse_args()
 os.environ['MAX_JOBS']='1'
-compiler='/opt/intel/oneapi/compiler/'+('2026.0'if args.onednn=='3132'else'2026.1')+'/bin/'
+compiler='/opt/intel/oneapi/compiler/'+('2026.0'if args.onednn=='3132'else'2026.0')+'/bin/'
 os.environ['CXX']=compiler+'icpx'
 os.environ['PATH']=compiler+'/opt/venv/bin:'+os.environ['PATH']
 os.environ['TORCH_XPU_ARCH_LIST']=''

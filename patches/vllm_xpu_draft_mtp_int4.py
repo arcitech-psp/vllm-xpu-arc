@@ -23,7 +23,7 @@ def quantize_to_int4(weight: torch.Tensor, group_size: int = 128):
     for i in range(0, N, 4096):
         wc = weight[i : i + 4096].float()
         wg = wc.view(wc.shape[0], num_groups, group_size)
-        scale = wg.abs().amax(dim=-1) / 7.0
+        scale = (wg.abs().amax(dim=-1) / 7.0).clamp_min(torch.finfo(torch.float16).tiny)
         q = (wg / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int32)
         qv = (q + 8).view(wc.shape[0], num_groups, group_size // 8, 8)
         parts.append(

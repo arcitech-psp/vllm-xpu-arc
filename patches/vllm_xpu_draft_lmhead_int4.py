@@ -25,7 +25,7 @@ def quantize_lmhead_to_int4(weight: torch.Tensor, group_size: int = 128):
         wc = weight[i : i + chunk].float()
         wg = wc.view(wc.shape[0], num_groups, group_size)
         maxabs = wg.abs().amax(dim=-1)
-        scale = maxabs / 7.0
+        scale = (maxabs / 7.0).clamp_min(torch.finfo(torch.float16).tiny)
         q = (wg / scale.unsqueeze(-1)).round().clamp(-8, 7).to(torch.int32)
         stored = q + 8
         qv = stored.view(wc.shape[0], num_groups, group_size // 8, 8)
@@ -66,9 +66,10 @@ def int4_lmhead_logits(
 
 @torch.no_grad()
 def build_draft_lmhead_int4(model) -> None:
-    if os.environ.get("B70_DRAFT_LMHEAD_INT4") != "1":
+    if (os.environ.get("B70_DRAFT_LMHEAD_INT4") != "1"
+            and os.environ.get("VLLM_XPU_DRAFT_LMHEAD_INT4") != "1"):
         return
-    if getattr(model, "_b70_lmhead_int4", None) is not None:
+    if getattr(model, "_vllm_xpu_lmhead_int4", None) is not None:
         return
     head = getattr(model, "lm_head", None)
     weight = getattr(head, "weight", None)
@@ -81,7 +82,7 @@ def build_draft_lmhead_int4(model) -> None:
         flush=True,
     )
     qweight, scales, qzeros, group_size = quantize_lmhead_to_int4(weight.detach())
-    model._b70_lmhead_int4 = (qweight, scales, qzeros, group_size)
+    model._vllm_xpu_lmhead_int4 = (qweight, scales, qzeros, group_size)
     fp16_bytes = weight.numel() * weight.element_size()
     int4_bytes = qweight.numel() * qweight.element_size() + scales.numel() * scales.element_size()
     print(
@@ -92,7 +93,7 @@ def build_draft_lmhead_int4(model) -> None:
 
 
 def draft_lmhead_int4_logits(model, hidden_states: torch.Tensor) -> torch.Tensor:
-    qweight, scales, qzeros, group_size = model._b70_lmhead_int4
+    qweight, scales, qzeros, group_size = model._vllm_xpu_lmhead_int4
     logits = int4_lmhead_logits(
         model, hidden_states, qweight, scales, qzeros, group_size
     )

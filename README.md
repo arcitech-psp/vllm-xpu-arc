@@ -352,3 +352,65 @@ this repository follows Apache-2.0 as documented in `LICENSE` and `NOTICE`.
 
 - [Tiel-Coder data repository](https://github.com/arcitech-psp/tiel-coder-xpu)
 - [Tiel-Coder model card](https://huggingface.co/arcitech-psp/Tiel-Coder-35B-A3B-W4A16-GPTQ-XPU-MTP)
+
+## Holo4-27B on the v0.30 XPU branch
+
+`holo4-v030` builds our fork on the pinned official vLLM v0.30.0 XPU image.
+It uses Intel's official oneAPI development image for CPU compilation; no
+third-party serving image or kernel overlay is a build input. Runtime
+qualification is recorded separately in `/home/psp/fork-update/GATES.md`.
+The existing Tiel measurements above do not describe Holo4 or this v0.30 build.
+
+```bash
+MAX_JOBS=2 docker build --build-arg MAX_JOBS=2 \
+  -f experimental/v0.30-rebase/Dockerfile \
+  -t vllm-xpu-arc:v030-20261006 .
+
+# On HADES, only after Claude creates /home/psp/holo4/B70-FREE:
+MODEL_DIR=/home/psp/holo4/chunks/c0 scripts/serve-holo4.sh
+```
+
+The native `auto-round` loader in v0.30 selects INC for
+`auto_round:auto_gptq` symmetric INT4 group-128 weights. We select its oneDNN
+W4A16 XPU backend. The visual tower, selected GDN projections and target
+LM head retain the publisher/exporter's BF16 weights. The added boundary
+patch casts activations/scales inside the FP16 oneDNN operation and returns
+BF16 to the model. It does not rewrite the quantization export.
+
+The grafted BF16 Qwen MTP head builds unquantized before our draft-only
+INT4 helpers activate. The helpers preserve target weights and restore
+the model dtype at each draft boundary. The helper aliases now match the
+rebased call sites, and zero-valued groups have finite positive scales.
+The existing mixed-GDN split and the cookbook partial-final-group fix are
+included. K=3 is the initial speculative configuration; acceptance and
+performance must be measured on Holo4.
+
+The serve script enables vision, FP8 attention KV, prefix caching, a
+131072-token limit, Qwen tool/reasoning parsers, and LoRA rank 32. Requests
+select the registered adapter with `"model": "jev-decision"`. The default
+Mamba SSM cache dtype is FP16, matching our earlier dense Qwen route; set
+`MAMBA_SSM_CACHE_DTYPE=float32` for a separately measured comparison.
+`MAX_NUM_SEQS` starts at eight. It is a scheduler limit, not a claim that
+eight full 128K sequences fit. The measured KV pool and full-length
+capacity belong in the gate evidence before tuning that limit.
+
+Our wrapper prepends `enable_thinking=false` and `reasoning_effort=low`
+defaults to Holo4's own native tokenizer template, preserving its vision
+and tool syntax. A request can override these template variables.
+The script writes only under the fork-update runtime directory; model
+and adapter mounts are read-only. No model is downloaded.
+
+The retained stock crash log shows a PyTorch BF16 top-k failure inside
+SYCL persistent-device-cache lookup. This build disables that disk cache
+and adds a guarded, exact sort fallback for XPU BF16 logprob top-k; the
+normal FP32/other-device paths remain upstream. Graph execution stays on.
+The stock retry failed before model loading with 6.59/30.3 GiB free versus
+a 29.39 GiB reservation. The original reservation check remains intact.
+Startup records total/free/allocated/reserved memory, and a separate
+preflight rejects the wrong GPU or competing allocations. The old log
+does not identify which client held the unavailable memory.
+
+Credits: [Hcompany Holo4](https://huggingface.co/Hcompany), the
+[Qwen team](https://github.com/QwenLM), [AutoRound / Intel](https://github.com/intel/auto-round),
+and [vLLM](https://github.com/vllm-project/vllm). Our fork changes remain
+Apache-2.0; publisher/model and adapter terms remain their own.
