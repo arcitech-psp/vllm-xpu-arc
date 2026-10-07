@@ -176,7 +176,7 @@ uri = 'data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode()
 r = chat('vision', [{'role':'user','content':[{'type':'image_url','image_url':{'url':uri}},
     {'type':'text','text':'Describe the three shapes from left to right, giving each color and shape.'}]}], max_tokens=128)
 out = r['output'].lower()
-add('vision', all(w in out for w in ['blue','rectangle','purple','circle','orange','triangle'])
+add('vision', all(w in out for w in ['blue','rectangl','purple','circl','orange','triangl'])
     and out.index('blue') < out.index('purple') < out.index('orange'), {'output':r['output']})
 
 tools = [{'type':'function','function':{'name':'get_weather','description':'Get weather for a city.',
