@@ -8,6 +8,11 @@ ADAPTER_DIR=${ADAPTER_DIR:-/home/psp/swift/jev/adapter_vllm}
 IMAGE=${VLLM_XPU_IMAGE:-vllm-xpu-arc:v030-20261006}
 CONTAINER_NAME=${CONTAINER_NAME:-fork-update-holo4-b70}
 PORT=${PORT:-8000}
+INC_BACKEND=${VLLM_XPU_INC_WNA16_BACKEND:-auto}
+INT4_COMPUTE_DTYPE=${VLLM_XPU_INT4_COMPUTE_DTYPE:-native}
+case "$INC_BACKEND" in auto|ark|w4a16|w4a8) ;; *) echo 'Invalid INC backend.' >&2; exit 64 ;; esac
+case "$INT4_COMPUTE_DTYPE" in native|float16) ;; *) echo 'Invalid INT4 compute dtype.' >&2; exit 64 ;; esac
+CACHE_DIR=$WORK_DIR/cache/${INC_BACKEND}-${INT4_COMPUTE_DTYPE}
 TEMPLATE_DIR=$WORK_DIR/runtime
 [[ -f "$FREE_MARKER" ]] || { echo 'B70-FREE absent: serving is gated.' >&2; exit 75; }
 [[ -r "$MODEL_DIR/config.json" ]] && \
@@ -15,7 +20,7 @@ TEMPLATE_DIR=$WORK_DIR/runtime
   echo 'Exported model configuration and safetensors weights are required.' >&2; exit 75;
 }
 [[ -r "$ADAPTER_DIR/adapter_config.json" ]] || { echo 'JEV adapter missing.' >&2; exit 75; }
-mkdir -p "$TEMPLATE_DIR" "$WORK_DIR/cache"
+mkdir -p "$TEMPLATE_DIR" "$CACHE_DIR"
 python3 "$SCRIPT_DIR/check-holo4-export.py" "$MODEL_DIR" \
   > "$WORK_DIR/export-preflight.json"
 python3 "$SCRIPT_DIR/prepare-holo4-template.py" --model "$MODEL_DIR" \
@@ -30,12 +35,13 @@ exec docker run --name "$CONTAINER_NAME" --device /dev/dri --group-add "$RG" \
   --ipc=host --shm-size=4g --memory=18g --memory-swap=18g \
   -p "${PORT}:8000" \
   -v "$MODEL_DIR:/models/holo4:ro" -v "$ADAPTER_DIR:/adapters/jev:ro" \
-  -v "$TEMPLATE_DIR:/templates:ro" -v "$WORK_DIR/cache:/cache" \
+  -v "$TEMPLATE_DIR:/templates:ro" -v "$CACHE_DIR:/cache" \
   -e ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-1}" -e ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE \
   -e VLLM_TARGET_DEVICE=xpu -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e VLLM_XPU_ENABLE_XPU_GRAPH="${VLLM_XPU_ENABLE_XPU_GRAPH:-1}" \
   -e VLLM_XPU_MTP_BF16_DRAFT=1 -e VLLM_XPU_DRAFT_LMHEAD_INT4=1 \
-  -e VLLM_XPU_DRAFT_MTP_INT4=1 -e VLLM_XPU_INC_WNA16_BACKEND=onednn \
+  -e VLLM_XPU_DRAFT_MTP_INT4=1 -e VLLM_XPU_INC_WNA16_BACKEND="$INC_BACKEND" \
+  -e VLLM_XPU_INT4_COMPUTE_DTYPE="$INT4_COMPUTE_DTYPE" \
   -e SYCL_CACHE_PERSISTENT=0 -e VLLM_XPU_USE_SAMPLER_KERNEL=0 \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \

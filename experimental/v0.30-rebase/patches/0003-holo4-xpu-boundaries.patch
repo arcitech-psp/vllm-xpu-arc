@@ -1,41 +1,54 @@
 --- a/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
 +++ b/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py
-@@ -324,7 +324,7 @@
- 
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
++import os
+ from typing import TYPE_CHECKING, Any
+
+ import torch
+@@ -324,7 +325,15 @@
+
          qweight_ct = qweight_data.t().contiguous()
          layer.qweight = Parameter(qweight_ct.t(), requires_grad=False)
 -        layer.scales = Parameter(layer.scales.data, requires_grad=False)
-+        layer.scales = Parameter(layer.scales.data.to(torch.float16), requires_grad=False)
++        # ARC_W4A16_BF16_BOUNDARY: pinned 0.1.14.1 supports native BF16.
++        compute_dtype = os.environ.get("VLLM_XPU_INT4_COMPUTE_DTYPE", "native")
++        if compute_dtype not in ("native", "float16"):
++            raise ValueError("VLLM_XPU_INT4_COMPUTE_DTYPE must be native or float16")
++        layer._arc_int4_fp16 = compute_dtype == "float16"
++        scales = layer.scales.data
++        if layer._arc_int4_fp16:
++            scales = scales.to(torch.float16)
++        layer.scales = Parameter(scales, requires_grad=False)
          layer.qzeros = Parameter(
              torch.tensor([8], dtype=torch.int8, device=device),
              requires_grad=False,
-@@ -337,17 +337,18 @@
-         bias: torch.Tensor | None = None,
+@@ -338,6 +347,9 @@
      ) -> torch.Tensor:
          out_shape = x.shape[:-1] + (layer.qweight.shape[1],)
--        reshaped_x = x.reshape(-1, x.shape[-1])
-+        # ARC_W4A16_BF16_BOUNDARY: oneDNN FP16 stays inside the quantized op.
-+        reshaped_x = x.reshape(-1, x.shape[-1]).to(torch.float16)
+         reshaped_x = x.reshape(-1, x.shape[-1])
++        if layer._arc_int4_fp16:
++            reshaped_x = reshaped_x.to(torch.float16)
++            bias = bias.to(torch.float16) if bias is not None else None
          out = torch.ops._xpu_C.int4_gemm_w4a16(
              reshaped_x,
              layer.qweight,
--            bias,
-+            bias.to(torch.float16) if bias is not None else None,
-             layer.scales,
-             layer.qzeros,
+@@ -347,7 +359,7 @@
              self.group_size,
              None,  # Retained by the external XPU op ABI.
          )
 -        return out.reshape(out_shape)
 +        return out.to(x.dtype).reshape(out_shape)
- 
- 
+
+
  class INCARKLinearMethod(INCXPULinearBase):
 --- a/vllm/v1/attention/backends/gdn_attn.py
 +++ b/vllm/v1/attention/backends/gdn_attn.py
 @@ -290,29 +290,47 @@
                  num_decode_tokens = 0
- 
+
              if num_prefills == 0 and num_decodes == 0:
 -                spec_token_size = min(
 -                    num_spec_decodes * (self.num_spec + 1),
@@ -107,13 +120,13 @@
 @@ -361,8 +379,9 @@
                      out=non_spec_query_start_loc_cpu[1:],
                  )
- 
+
 -            assert num_accepted_tokens is not None
 -            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 +            if spec_sequence_masks_cpu is not None:
 +                assert num_accepted_tokens is not None
 +                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
- 
+
          chunk_indices: torch.Tensor | None = None
          chunk_offsets: torch.Tensor | None = None
 --- a/vllm/v1/worker/gpu/sample/logprob.py
@@ -123,13 +136,13 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
 +import os
- 
+
  import numpy as np
  import torch
 @@ -106,6 +108,17 @@
      return logprobs
- 
- 
+
+
 +
 +def _arc_topk_indices(logits: torch.Tensor, count: int) -> torch.Tensor:
 +    # ARC_XPU_BF16_TOPK: torch 2.13 BF16 single-workgroup top-k crashed in
@@ -155,7 +168,7 @@
              scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
 @@ -138,7 +151,7 @@
          assert expanded_idx_mapping is not None
- 
+
          if num_logprobs > 0:
 -            topk_token_ids = torch.topk(logits, num_logprobs, dim=-1).indices
 +            topk_token_ids = _arc_topk_indices(logits, num_logprobs)
@@ -165,7 +178,7 @@
 --- a/vllm/v1/worker/xpu_worker.py
 +++ b/vllm/v1/worker/xpu_worker.py
 @@ -177,6 +177,14 @@
- 
+
          # take current memory snapshot
          self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
 +        logger.info(

@@ -371,11 +371,15 @@ MODEL_DIR=/home/psp/holo4/chunks/c0 scripts/serve-holo4.sh
 ```
 
 The native `auto-round` loader in v0.30 selects INC for
-`auto_round:auto_gptq` symmetric INT4 group-128 weights. We select its oneDNN
-W4A16 XPU backend. The visual tower, selected GDN projections and target
+`auto_round:auto_gptq` symmetric INT4 group-128 weights. The launcher preserves
+the supervisor's `auto` backend selection (ARK when available, otherwise
+oneDNN W4A16). Set `VLLM_XPU_INC_WNA16_BACKEND=w4a16` to select oneDNN explicitly.
+`onednn` is not a valid v0.30 environment value. The visual tower, selected GDN projections and target
 LM head retain the publisher/exporter's BF16 weights. The added boundary
-patch casts activations/scales inside the FP16 oneDNN operation and returns
-BF16 to the model. It does not rewrite the quantization export.
+patch uses the pinned XPU kernel's native BF16 oneDNN path for target linears.
+`VLLM_XPU_INT4_COMPUTE_DTYPE=float16` selects an explicit private FP16 fallback
+with one-time scale conversion and BF16 output. Runtime gates must qualify the
+selected path; no quantization export is rewritten.
 
 The grafted BF16 Qwen MTP head builds unquantized before our draft-only
 INT4 helpers activate. The helpers preserve target weights and restore

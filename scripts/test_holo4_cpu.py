@@ -25,7 +25,7 @@ class DraftTests(unittest.TestCase):
         if not source.exists():
             self.skipTest('Patched source is not mounted')
         node = next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.ClassDef) and n.name=='INCXPULinearMethod')
-        namespace = {'torch':torch,'Parameter':torch.nn.Parameter,'INCXPULinearBase':object}
+        namespace = {'torch':torch,'os':os,'Parameter':torch.nn.Parameter,'INCXPULinearBase':object}
         exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),namespace)
         method = namespace['INCXPULinearMethod']()
         method.group_size = 128
@@ -33,7 +33,8 @@ class DraftTests(unittest.TestCase):
         layer = torch.nn.Module()
         layer.qweight = torch.nn.Parameter(torch.zeros(16,16,dtype=torch.int32),requires_grad=False)
         layer.scales = torch.nn.Parameter(torch.ones(1,16,dtype=torch.bfloat16),requires_grad=False)
-        method.process_weights_after_loading(layer)
+        with patch.dict(os.environ,{'VLLM_XPU_INT4_COMPUTE_DTYPE':'float16'}):
+            method.process_weights_after_loading(layer)
         self.assertEqual(layer.scales.dtype,torch.float16)
         scales_id = layer.scales.data_ptr()
         seen=[]
@@ -45,6 +46,31 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(out.dtype,torch.bfloat16)
         self.assertTrue((out==2).all())
         self.assertEqual(seen,[(torch.float16,torch.float16,torch.float16,scales_id)])
+
+    def test_native_target_boundary_preserves_dtype_and_scale_storage(self):
+        source = Path('/source/vllm/model_executor/layers/quantization/inc/schemes/inc_wna16_linear.py')
+        node = next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.ClassDef) and n.name=='INCXPULinearMethod')
+        namespace = {'torch':torch,'os':os,'Parameter':torch.nn.Parameter,'INCXPULinearBase':object}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),namespace)
+        method = namespace['INCXPULinearMethod']()
+        method.group_size = 128
+        method.is_awq_packed = False
+        layer = torch.nn.Module()
+        layer.qweight = torch.nn.Parameter(torch.zeros(16,16,dtype=torch.int32),requires_grad=False)
+        layer.scales = torch.nn.Parameter(torch.ones(1,16,dtype=torch.bfloat16),requires_grad=False)
+        scales_id = layer.scales.data_ptr()
+        with patch.dict(os.environ,{'VLLM_XPU_INT4_COMPUTE_DTYPE':'native'}):
+            method.process_weights_after_loading(layer)
+        self.assertEqual(layer.scales.data_ptr(),scales_id)
+        seen=[]
+        def gemm(x,qweight,bias,scales,*args):
+            seen.append((x.dtype,bias.dtype,scales.dtype,scales.data_ptr()))
+            return torch.ones(x.shape[0],16,dtype=torch.bfloat16)+bias
+        with patch.object(torch.ops._xpu_C,'int4_gemm_w4a16',gemm,create=True):
+            out=method.apply_weights(layer,torch.ones(2,128,dtype=torch.bfloat16),torch.ones(16,dtype=torch.bfloat16))
+        self.assertEqual(out.dtype,torch.bfloat16)
+        self.assertTrue((out==2).all())
+        self.assertEqual(seen,[(torch.bfloat16,torch.bfloat16,torch.bfloat16,scales_id)])
 
     def test_zero_and_nonzero_packing(self):
         torch.manual_seed(17)

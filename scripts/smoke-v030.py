@@ -7,10 +7,12 @@ from pathlib import Path
 import sysconfig
 import torch
 import vllm
+from vllm import envs
 
 assert not torch.xpu.is_initialized()
 site = Path(sysconfig.get_paths()['purelib'])
 assert vllm.__version__.startswith('0.30.0'),vllm.__version__
+assert envs.VLLM_XPU_INC_WNA16_BACKEND in {'auto','ark','w4a16','w4a8'}
 markers = {
     'vllm/v1/attention/backends/gdn_attn.py':'B70_MTP_PARTIAL_FINAL_GROUP',
     'vllm/v1/worker/gpu/sample/logprob.py':'ARC_XPU_BF16_TOPK',
@@ -39,5 +41,6 @@ assert not torch.xpu.is_initialized()
 print(json.dumps({'vllm':vllm.__version__,'torch':torch.__version__,
     'xpu_kernels':importlib.metadata.version('vllm-xpu-kernels'),
     'gguf':importlib.metadata.version('gguf'),'patches':list(markers.values()),
+    'inc_backend':envs.VLLM_XPU_INC_WNA16_BACKEND,
     'entrypoint_sha256':hashlib.sha256(entrypoint.read_bytes()).hexdigest(),
     'native_libraries_loaded':3,'xpu_initialized':torch.xpu.is_initialized()},indent=2))
