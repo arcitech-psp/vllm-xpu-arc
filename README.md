@@ -371,9 +371,10 @@ MODEL_DIR=/home/psp/holo4/chunks/c0 scripts/serve-holo4.sh
 ```
 
 The native `auto-round` loader in v0.30 selects INC for
-`auto_round:auto_gptq` symmetric INT4 group-128 weights. The launcher preserves
-the supervisor's `auto` backend selection (ARK when available, otherwise
-oneDNN W4A16). Set `VLLM_XPU_INC_WNA16_BACKEND=w4a16` to select oneDNN explicitly.
+`auto_round:auto_gptq` symmetric INT4 group-128 weights. The launcher defaults to
+`VLLM_XPU_INC_WNA16_BACKEND=w4a16`, explicitly selecting oneDNN W4A16
+for the B70. `auto` remains an optional backend override; it is not the
+launcher's default.
 `onednn` is not a valid v0.30 environment value. The visual tower, selected GDN projections and target
 LM head retain the publisher/exporter's BF16 weights. The added boundary
 patch uses the pinned XPU kernel's native BF16 oneDNN path for target linears.
