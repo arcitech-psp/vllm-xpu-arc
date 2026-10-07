@@ -33,7 +33,8 @@ tokenizer.chat_template = Path(a.template).read_text()
 records = []
 expected = ['identity', 'KV pool', 'chat', 'vision', 'tool call parses', 'needle100k',
             'decode C1 4096', 'decode C1 65536', 'decode C1 122880',
-            'decode C3', 'JEV LoRA loads and answers', 'MTP partial 128K boundary', 'MTP acceptance nonzero']
+            'decode C3 4096', 'decode C3 65536', 'decode C3 122880',
+            'JEV LoRA loads and answers', 'MTP partial 128K boundary', 'MTP acceptance nonzero']
 
 def deadline():
     if not a.free_marker.is_file():
@@ -123,8 +124,8 @@ def exact_prompt(target, nonce, needle=False):
         raise RuntimeError(f'Prompt length calibration failed: {len(ids)} vs {target}')
     return messages
 
-def add(name, passed, details):
-    records.append({'gate': name, 'status': 'PASS' if passed else 'FAIL', 'details': details})
+def add(name, passed, details, status=None):
+    records.append({'gate': name, 'status': status or ('PASS' if passed else 'FAIL'), 'details': details})
     (a.output / 'gates.json').write_text(json.dumps(records, indent=2))
     lines = ['# Holo4 gates', '', 'Raw request, response, timing and metrics files are in evidence/.', '',
              'Client decode rate is (completion tokens - 1) / time after first visible delta; TTFT is separate.',
@@ -156,7 +157,7 @@ for family in text_string_to_metric_families((a.output/'initial.prom').read_text
 if cache:
     capacity = float(cache.get('kv_cache_max_concurrency','0'))
     add('KV pool',capacity >= 1,{'labels':cache,'full_131072_sequence_capacity_floor':math.floor(capacity),
-        'note':'Allocated pool capacity reported by vLLM; C3 decode is separately measured at 4K.'})
+        'note':'Allocated pool capacity reported by vLLM; C3 overlap is measured separately at each supported length.'})
 else:
     add('KV pool',False,{'error':'Cache pool metric unavailable; inspect startup logs'})
 
@@ -220,22 +221,31 @@ for target in [4096, 65536, 122880]:
          'server_decode_tokens_s':[r.get('server_decode_tokens_s') for r in rows],
          'ttft_seconds':[r['ttft_seconds'] for r in rows], 'n':len(rows)})
 
-def concurrent_request(i):
-    nonce = hashlib.sha256(f'c3-{i}-{time.time_ns()}'.encode()).hexdigest()[:16]
-    return chat(f'c3-{i}', exact_prompt(4096,nonce), max_tokens=512,min_tokens=512,ignore_eos=True)
-before = metrics('c3-before')
-start = time.monotonic()
-with ThreadPoolExecutor(max_workers=3) as pool:
-    rows = list(pool.map(concurrent_request, range(3)))
-elapsed = time.monotonic()-start
-after = metrics('c3-after')
-overlap = min(r['finished_monotonic'] for r in rows)-max(r['first_delta_monotonic'] for r in rows)
-add('decode C3', all(r['usage']['completion_tokens']==512 for r in rows) and overlap > 0,
-    {'per_chat_client_decode_tokens_s':[r['client_decode_tokens_s'] for r in rows],
-     'ttft_seconds':[r['ttft_seconds'] for r in rows],
-     'aggregate_end_to_end_tokens_s':sum(r['usage']['completion_tokens'] for r in rows)/elapsed,
-     'all_three_decode_overlap_seconds':max(overlap,0),
-     'note':'Aggregate includes prefill; it is not decode throughput.'})
+for target in [4096,65536,122880]:
+    if cache and float(cache['kv_cache_size_tokens']) < 3*(target+512):
+        add(f'decode C3 {target}',False,
+            {'required_token_capacity':3*(target+512),'pool_token_capacity':cache['kv_cache_size_tokens'],
+             'note':'Three full requests cannot fit this allocated pool; no C3 speed claim at this length.'},status='NOT FIT')
+        continue
+    def concurrent_request(i):
+        nonce = hashlib.sha256(f'c3-{target}-{i}-{time.time_ns()}'.encode()).hexdigest()[:16]
+        return chat(f'c3-{target}-{i}', exact_prompt(target,nonce), max_tokens=512,min_tokens=512,ignore_eos=True)
+    before = metrics(f'c3-{target}-before')
+    if before.get('vllm:num_requests_running',0) or before.get('vllm:num_requests_waiting',0):
+        raise RuntimeError('Server is busy before C3 measurement; preserve the active request')
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        rows = list(pool.map(concurrent_request, range(3)))
+    elapsed = time.monotonic()-start
+    after = metrics(f'c3-{target}-after')
+    overlap = min(r['finished_monotonic'] for r in rows)-max(r['first_delta_monotonic'] for r in rows)
+    add(f'decode C3 {target}', all(r['usage']['completion_tokens']==512 and not r['reasoning'] for r in rows) and overlap > 0,
+        {'prompt_tokens':[r['usage']['prompt_tokens'] for r in rows],
+         'per_chat_client_decode_tokens_s':[r.get('client_decode_tokens_s') for r in rows],
+         'ttft_seconds':[r['ttft_seconds'] for r in rows],
+         'aggregate_end_to_end_tokens_s':sum(r['usage']['completion_tokens'] for r in rows)/elapsed,
+         'all_three_decode_overlap_seconds':max(overlap,0),
+         'note':'Aggregate includes prefill; it is not decode throughput.'})
 
 r = chat('jev', [{'role':'user','content':'Choose one word: yes or no. Is 2 + 2 equal to 4?'}], model='jev-decision', max_tokens=64)
 add('JEV LoRA loads and answers', bool(r['output'].strip()), {'output':r['output'], 'usage':r['usage']})
@@ -256,4 +266,5 @@ draft = sum(v-base.get(k,0) for k,v in final.items() if k.endswith('draft_tokens
 accepted = sum(v-base.get(k,0) for k,v in final.items() if k.endswith('accepted_tokens_total'))
 add('MTP acceptance nonzero', draft > 0 and accepted > 0,
     {'draft_tokens':draft,'accepted_tokens':accepted,'acceptance':accepted/draft if draft else None})
-raise SystemExit(0 if all(r['status']=='PASS' for r in records) else 1)
+raise SystemExit(0 if all(r['status'] in ['PASS','NOT FIT'] for r in records)
+    and any(r['gate']=='decode C3 4096' and r['status']=='PASS' for r in records) else 1)
