@@ -8,7 +8,7 @@ ADAPTER_DIR=${ADAPTER_DIR:-/home/psp/swift/jev/adapter_vllm}
 IMAGE=${VLLM_XPU_IMAGE:-vllm-xpu-arc:v030-20261006}
 CONTAINER_NAME=${CONTAINER_NAME:-fork-update-holo4-b70}
 PORT=${PORT:-8000}
-INC_BACKEND=${VLLM_XPU_INC_WNA16_BACKEND:-auto}
+INC_BACKEND=${VLLM_XPU_INC_WNA16_BACKEND:-w4a16}  # auto picks ARK, whose kernel traps (invalid opcode) on the B70; w4a16 is the measured, served path (2026-10-07)
 INT4_COMPUTE_DTYPE=${VLLM_XPU_INT4_COMPUTE_DTYPE:-native}
 case "$INC_BACKEND" in auto|ark|w4a16|w4a8) ;; *) echo 'Invalid INC backend.' >&2; exit 64 ;; esac
 case "$INT4_COMPUTE_DTYPE" in native|float16) ;; *) echo 'Invalid INT4 compute dtype.' >&2; exit 64 ;; esac
