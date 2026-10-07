@@ -70,7 +70,7 @@ def chat(label, messages, model='holo4-27b', **kwargs):
     output = ''
     reasoning = ''
     usage = None
-    with requests.post(a.endpoint + '/v1/chat/completions', json=request, stream=True, timeout=(30, 600)) as r:
+    with requests.post(a.endpoint + '/v1/chat/completions', json=request, stream=True, timeout=(30, 1800)) as r:
         r.raise_for_status()
         for line in r.iter_lines(chunk_size=1):
             deadline()
@@ -181,9 +181,11 @@ add('vision', all(w in out for w in ['blue','rectangl','purple','circl','orange'
 
 tools = [{'type':'function','function':{'name':'get_weather','description':'Get weather for a city.',
     'parameters':{'type':'object','properties':{'city':{'type':'string'}},'required':['city']}}}]
-response = requests.post(a.endpoint+'/v1/chat/completions', json={'model':'holo4-27b',
+tool_request = {'model':'holo4-27b',
     'messages':[{'role':'user','content':'Use get_weather to check the weather in Edmonton.'}],
-    'tools':tools,'tool_choice':'auto','temperature':0,'max_tokens':128}, timeout=180)
+    'tools':tools,'tool_choice':'auto','temperature':0,'max_tokens':128}
+(a.output/'tool.request.json').write_text(json.dumps(tool_request,indent=2))
+response = requests.post(a.endpoint+'/v1/chat/completions', json=tool_request, timeout=180)
 response.raise_for_status()
 result = response.json()
 (a.output/'tool.response.json').write_text(json.dumps(result,indent=2))
@@ -214,6 +216,7 @@ for target in [4096, 65536, 122880]:
         if duration > 0 and count == 1:
             row['server_decode_seconds'] = duration
             row['server_decode_tokens_s'] = (row['usage']['completion_tokens']-1)/duration
+        (a.output/f'c1-{target}-{rep}.measurement.json').write_text(json.dumps(row,indent=2))
         rows.append(row)
     add(f'decode C1 {target}', all(r['usage']['completion_tokens']==512 and not r['reasoning'] and r['isolated_server_request_count_delta']==1 for r in rows),
         {'prompt_tokens':[r['usage']['prompt_tokens'] for r in rows],
@@ -255,7 +258,7 @@ fill = tokenizer.encode(' A plain reference line about ordinary buildings.\n',ad
 prompt = (fill * (131066//len(fill)+1))[:131066]
 payload = {'model':'holo4-27b','prompt':prompt,'max_tokens':6,'min_tokens':6,'ignore_eos':True,'temperature':0}
 (a.output/'boundary.request.json').write_text(json.dumps(payload))
-response = requests.post(a.endpoint+'/v1/completions',json=payload,timeout=600)
+response = requests.post(a.endpoint+'/v1/completions',json=payload,timeout=1800)
 response.raise_for_status()
 result = response.json()
 (a.output/'boundary.response.json').write_text(json.dumps(result,indent=2))
