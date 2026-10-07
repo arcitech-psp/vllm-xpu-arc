@@ -21,7 +21,7 @@ TEMPLATE_DIR=$WORK_DIR/runtime
 }
 [[ -r "$ADAPTER_DIR/adapter_config.json" ]] || { echo 'JEV adapter missing.' >&2; exit 75; }
 mkdir -p "$TEMPLATE_DIR" "$CACHE_DIR"
-python3 "$SCRIPT_DIR/check-holo4-export.py" "$MODEL_DIR" \
+[[ "${SKIP_EXPORT_CHECK:-0}" = 1 ]] || python3 "$SCRIPT_DIR/check-holo4-export.py" "$MODEL_DIR" \
   > "$WORK_DIR/export-preflight.json"
 python3 "$SCRIPT_DIR/prepare-holo4-template.py" --model "$MODEL_DIR" \
   --output "$TEMPLATE_DIR/chat_template_fast.jinja"
@@ -39,8 +39,8 @@ exec docker run --name "$CONTAINER_NAME" --device /dev/dri --group-add "$RG" \
   -e ZE_AFFINITY_MASK="${ZE_AFFINITY_MASK:-1}" -e ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE \
   -e VLLM_TARGET_DEVICE=xpu -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
   -e VLLM_XPU_ENABLE_XPU_GRAPH="${VLLM_XPU_ENABLE_XPU_GRAPH:-1}" \
-  -e VLLM_XPU_MTP_BF16_DRAFT=1 -e VLLM_XPU_DRAFT_LMHEAD_INT4=1 \
-  -e VLLM_XPU_DRAFT_MTP_INT4=1 -e VLLM_XPU_INC_WNA16_BACKEND="$INC_BACKEND" \
+  -e VLLM_XPU_MTP_BF16_DRAFT=1 -e VLLM_XPU_DRAFT_LMHEAD_INT4=${DRAFT_LMHEAD_INT4:-0} \
+  -e VLLM_XPU_DRAFT_MTP_INT4=${DRAFT_MTP_INT4:-0} -e VLLM_XPU_INC_WNA16_BACKEND="$INC_BACKEND" \
   -e VLLM_XPU_INT4_COMPUTE_DTYPE="$INT4_COMPUTE_DTYPE" \
   -e SYCL_CACHE_PERSISTENT=0 -e VLLM_XPU_USE_SAMPLER_KERNEL=0 \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
@@ -54,7 +54,7 @@ exec docker run --name "$CONTAINER_NAME" --device /dev/dri --group-add "$RG" \
   --max-num-seqs "${MAX_NUM_SEQS:-8}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-4096}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.97}" \
-  --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}' \
+  --speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":${MTP_TOKENS:-4}}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --enable-lora --max-lora-rank 32 --lora-modules jev-decision=/adapters/jev \
   --limit-mm-per-prompt '{"image":1,"video":0}' \
