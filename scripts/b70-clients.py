@@ -9,6 +9,7 @@ for path in sorted(Path('/sys/class/drm').glob('renderD*')):
     devices.append({'render':path.name,'pci':pci})
 clients = []
 seen = set()
+inaccessible_processes = 0
 for proc in Path('/proc').iterdir():
     if not proc.name.isdigit():
         continue
@@ -25,5 +26,9 @@ for proc in Path('/proc').iterdir():
             seen.add(ident)
             clients.append({'pid':int(proc.name),'comm':comm,**values})
     except (OSError,PermissionError):
+        if proc.exists():
+            inaccessible_processes += 1
         continue
-print(json.dumps({'devices':devices,'accessible_clients':clients},indent=2))
+print(json.dumps({'devices':devices,'accessible_clients':clients,
+                 'inaccessible_processes':inaccessible_processes,
+                 'coverage':'accessible process fdinfo only; an empty list is not proof of a free GPU'},indent=2))
