@@ -54,7 +54,7 @@ exec docker run --name "$CONTAINER_NAME" --device /dev/dri --group-add "$RG" \
   --max-num-seqs "${MAX_NUM_SEQS:-8}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-4096}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.97}" \
-  --speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":${MTP_TOKENS:-4}}" \
+  --speculative-config "{\"method\":\"qwen3_5_mtp\",\"num_speculative_tokens\":${MTP_TOKENS:-3}}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --enable-lora --max-lora-rank 32 --lora-modules jev-decision=/adapters/jev \
   --limit-mm-per-prompt '{"image":1,"video":0}' \
