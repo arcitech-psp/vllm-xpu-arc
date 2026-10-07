@@ -71,6 +71,8 @@ def chat(label, messages, model='holo4-27b', **kwargs):
     reasoning = ''
     usage = None
     with requests.post(a.endpoint + '/v1/chat/completions', json=request, stream=True, timeout=(30, 1800)) as r:
+        if not r.ok:
+            (a.output/f'{label}.error.json').write_text(json.dumps({'http_status':r.status_code,'body':r.text},indent=2))
         r.raise_for_status()
         for line in r.iter_lines(chunk_size=1):
             deadline()
@@ -125,6 +127,7 @@ def exact_prompt(target, nonce, needle=False):
     return messages
 
 def add(name, passed, details, status=None):
+    records[:] = [r for r in records if r['gate'] != name]
     records.append({'gate': name, 'status': status or ('PASS' if passed else 'FAIL'), 'details': details})
     (a.output / 'gates.json').write_text(json.dumps(records, indent=2))
     lines = ['# Holo4 gates', '', 'Raw request, response, timing and metrics files are in evidence/.', '',
@@ -136,6 +139,8 @@ def add(name, passed, details, status=None):
         if not any(r['gate']==name for r in records):
             lines += [f'- **{name}: NOT RUN**']
     (a.output.parent / 'GATES.md').write_text('\n'.join(lines)+'\n')
+    if not passed and name in ['chat','vision','tool call parses','needle100k','JEV LoRA loads and answers']:
+        raise RuntimeError(f'Functional gate failed: {name}; preserve evidence and fix before benchmarking')
 
 def exception_hook(kind, value, traceback):
     add('runner exception', False, {'type':kind.__name__, 'error':str(value)})
@@ -186,6 +191,8 @@ tool_request = {'model':'holo4-27b',
     'tools':tools,'tool_choice':'auto','temperature':0,'max_tokens':128}
 (a.output/'tool.request.json').write_text(json.dumps(tool_request,indent=2))
 response = requests.post(a.endpoint+'/v1/chat/completions', json=tool_request, timeout=180)
+if not response.ok:
+    (a.output/'tool.error.json').write_text(json.dumps({'http_status':response.status_code,'body':response.text},indent=2))
 response.raise_for_status()
 result = response.json()
 (a.output/'tool.response.json').write_text(json.dumps(result,indent=2))
@@ -193,6 +200,17 @@ calls = result['choices'][0]['message'].get('tool_calls') or []
 city = json.loads(calls[0]['function']['arguments']).get('city','') if calls else ''
 passed = bool(calls) and calls[0]['function']['name']=='get_weather' and isinstance(city,str) and city.strip().lower().startswith('edmonton')
 add('tool call parses', passed, result)
+
+r = chat('jev', [{'role':'user','content':'Choose one word: yes or no. Is 2 + 2 equal to 4?'}], model='jev-decision', max_tokens=64)
+add('JEV LoRA loads and answers', bool(r['output'].strip()), {'output':r['output'], 'usage':r['usage']})
+early = metrics('functional')
+draft = sum(v-base.get(k,0) for k,v in early.items() if k.endswith('draft_tokens_total'))
+accepted = sum(v-base.get(k,0) for k,v in early.items() if k.endswith('accepted_tokens_total'))
+positive = draft > 0 and accepted > 0
+add('MTP acceptance nonzero', positive,
+    {'draft_tokens':draft,'accepted_tokens':accepted,'acceptance':accepted/draft if draft else None,
+     'snapshot':'functional.prom','note':'Final counters are captured again after long-context gates.'},
+    status='PASS' if positive else 'NOT YET')
 
 nonce = hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:16]
 r = chat('needle100k', exact_prompt(100000, nonce, needle=True), max_tokens=64)
@@ -250,15 +268,14 @@ for target in [4096,65536,122880]:
          'all_three_decode_overlap_seconds':max(overlap,0),
          'note':'Aggregate includes prefill; it is not decode throughput.'})
 
-r = chat('jev', [{'role':'user','content':'Choose one word: yes or no. Is 2 + 2 equal to 4?'}], model='jev-decision', max_tokens=64)
-add('JEV LoRA loads and answers', bool(r['output'].strip()), {'output':r['output'], 'usage':r['usage']})
-
 deadline()
 fill = tokenizer.encode(' A plain reference line about ordinary buildings.\n',add_special_tokens=False)
 prompt = (fill * (131066//len(fill)+1))[:131066]
 payload = {'model':'holo4-27b','prompt':prompt,'max_tokens':6,'min_tokens':6,'ignore_eos':True,'temperature':0}
 (a.output/'boundary.request.json').write_text(json.dumps(payload))
 response = requests.post(a.endpoint+'/v1/completions',json=payload,timeout=1800)
+if not response.ok:
+    (a.output/'boundary.error.json').write_text(json.dumps({'http_status':response.status_code,'body':response.text},indent=2))
 response.raise_for_status()
 result = response.json()
 (a.output/'boundary.response.json').write_text(json.dumps(result,indent=2))
